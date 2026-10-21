@@ -1,4 +1,4 @@
-/* Schedule Manager UI. State lives in localStorage; data.js is only the seed. */
+/* Schedule Manager UI. State lives in localStorage. */
 (() => {
   'use strict';
   const E = window.Engine;
@@ -21,10 +21,6 @@
     return c;
   }
   const defaultUI = () => ({ tab: 'dashboard', showPast: false, showSummers: false, scopeAll: true, q: '', fStatus: '', fCat: '', sort: 'code', dir: 1, calendarMode: 'month', calendarDate: '', calendarTerm: '' });
-  function seedState() {
-    const sd = structuredClone(window.SEED);
-    return { v: 1, meta: sd.meta, minor: sd.minor, courses: sd.courses.map(fixCourse), terms: sd.terms.map((t) => t.id), settings: { ...E.DEFAULTS }, ui: defaultUI() };
-  }
   function blankState() {
     const current = E.currentTermId(E.DEFAULTS);
     return {
@@ -37,6 +33,17 @@
       ui: defaultUI(),
     };
   }
+  function externalState(seed) {
+    return {
+      v: 1,
+      meta: seed.meta || { student: 'New plan', program: 'Custom schedule', source: 'external seed' },
+      minor: seed.minor || null,
+      courses: Array.isArray(seed.courses) ? seed.courses.map(fixCourse) : [],
+      terms: Array.isArray(seed.terms) ? seed.terms.map((t) => t.id || t) : [E.currentTermId(E.DEFAULTS)],
+      settings: { ...E.DEFAULTS },
+      ui: defaultUI(),
+    };
+  }
   function loadState() {
     try {
       const o = JSON.parse(localStorage.getItem(KEY) || 'null');
@@ -45,8 +52,19 @@
         if (o.ui.tab === 'planner' || o.ui.tab === 'schedule') o.ui.tab = 'timeline';
         return o;
       }
+      async function loadExternalSeed() {
+        if (!/^https?:$/.test(location.protocol)) return null;
+        try {
+          const response = await fetch('/api/seed-data', { headers: { Accept: 'application/json' } });
+          if (!response.ok) return null;
+          const data = await response.json();
+          return data.available && data.seed ? externalState(data.seed) : null;
+        } catch (error) {
+          return null;
+        }
+      }
     } catch (e) { /* storage blocked or corrupt: fall through to seed */ }
-    return seedState();
+    return blankState();
   }
   function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* private mode: state lives in memory only */ } }
   function normalizeTerms() {
@@ -776,7 +794,7 @@
       <div class="row"><span class="grow"><b>Backup</b><br><span class="muted">Full state: courses, terms, settings</span></span><button class="btn" data-act="export-json">Export JSON</button><button class="btn" data-act="import-json">Import JSON…</button></div>
       <div class="row"><span class="grow"><b>Schedule as CSV</b><br><span class="muted">One row per course. Code and Title are required; Term may be an ID such as FA26 or a label such as Fall 2026.</span></span><button class="btn" data-act="export-csv">Export CSV</button><button class="btn" data-act="import-csv">Import CSV…</button></div>
       <div class="row"><span class="grow"><b>Start a blank schedule</b><br><span class="muted">Removes the spreadsheet courses and starts with the current semester.</span></span><button class="btn danger" data-act="blank">Create blank…</button></div>
-      <div class="row"><span class="grow"><b>Reset to spreadsheet data</b><br><span class="muted">Discards all edits and reloads data.js (${esc(S.meta.source || 'seed')})</span></span><button class="btn danger" data-act="reset">Reset…</button></div>`));
+      <div class="row"><span class="grow"><b>Reset plan</b><br><span class="muted">Discards all courses and starts a blank local schedule.</span></span><button class="btn danger" data-act="reset">Reset…</button></div>`));
   }
   function exportCsv() {
     const cx = ctx(), q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
@@ -977,7 +995,7 @@
       case 'import-json':
       case 'import-csv': $('#file-import').dataset.format = act === 'import-csv' ? 'csv' : 'json'; $('#file-import').click(); break;
       case 'export-csv': exportCsv(); break;
-      case 'reset': if (confirm('Discard all edits and reload the spreadsheet data?')) { undoStack = []; S = seedState(); normalizeTerms(); save(); closeDlg(); render(); toast('Reset to spreadsheet data'); } break;
+      case 'reset': if (confirm('Discard all courses and start a blank schedule?')) { undoStack = []; S = blankState(); save(); closeDlg(); render(); toast('Blank schedule created'); } break;
       case 'blank': if (confirm('Discard this plan and start a blank schedule? Export a backup first if you need these courses later.')) { undoStack = []; S = blankState(); save(); closeDlg(); render(); toast('Blank schedule created'); } break;
     }
   });
@@ -1047,7 +1065,11 @@
   });
 
   /* ================= boot ================= */
-  S = loadState(); normalizeTerms(); render();
-  if (!S.meta.portalSyncedAt && /^https?:$/.test(location.protocol)) setTimeout(() => syncMyPortal(true), 0);
-  window.__sched = { get state() { return S; }, Engine: E, render };
+  (async () => {
+    const saved = localStorage.getItem(KEY);
+    S = saved ? loadState() : (await loadExternalSeed()) || blankState();
+    normalizeTerms(); render();
+    if (!S.meta.portalSyncedAt && /^https?:$/.test(location.protocol)) setTimeout(() => syncMyPortal(true), 0);
+    window.__sched = { get state() { return S; }, Engine: E, render };
+  })();
 })();

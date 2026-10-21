@@ -10,7 +10,13 @@ A local schedule planner for Trine students. Use it to organize courses by term,
 The planner itself still works from any static host (or `file://` in most browsers), but **Search MyPortal** requires `server.py` so the remote request can be made without exposing a session cookie to browser JavaScript.
 
 State is stored in the browser (localStorage, per origin). Use **Data → Export JSON** to back up or move between devices.
-Use **Data → Create blank** to start without the spreadsheet, or **Import CSV** to add courses from a file with `Code` and `Title` columns. Optional columns include `Term`, `Credits`, `Grade`, `Category`, `Offered`, `Prerequisites`, and `Notes`. Terms may be IDs such as `FA26` or labels such as `Fall 2026`.
+The repository contains only the manager; plans are created locally in your browser. Use **Data → Create blank** to start a new plan, or **Import CSV** to add courses from a file with `Code` and `Title` columns. Optional columns include `Term`, `Credits`, `Grade`, `Category`, `Offered`, `Prerequisites`, and `Notes`. Terms may be IDs such as `FA26` or labels such as `Fall 2026`.
+
+To load a private generated plan without putting it in Git, set `SCHEDULE_DATA_FILE` in `.env` to the absolute path of your generated `data.js` file:
+
+    SCHEDULE_DATA_FILE=/home/you/private/schedule-data.js
+
+The local server reads that file only at runtime and serves it to the local browser. If the setting is blank or the file is unavailable, the app starts with a blank plan. Existing browser data takes precedence.
 
 ## Use the planner
 
@@ -40,7 +46,7 @@ MyPortal may not have published every future semester yet. **Not listed** or **s
 | `index.html`, `style.css` | shell + styling (light/dark follows OS) |
 | `engine.js` | pure rules + optimizer (no DOM): offerings, prereqs, min grades, standing, credit limits |
 | `app.js` | UI: planner board, requirements, catalog, dialogs |
-| `data.js` | seed generated from the spreadsheet (only used on first load / reset) |
+| external `data.js` | optional private generated seed, configured with `SCHEDULE_DATA_FILE` |
 | `server.py` | local static server + MyPortal Web Forms search proxy |
 | `tools/build_data.py` | regenerates `data.js` from an updated control sheet |
 
@@ -63,9 +69,9 @@ You may instead paste compact, single-line JSON after `MYPORTAL_COOKIES_JSON=` o
 ## Updating from a new spreadsheet
 
     pip install openpyxl
-    python3 tools/build_data.py "BSCS_....xlsx" data.js
+    python3 tools/build_data.py "/path/to/private/control-sheet.xlsx" "/path/to/private/schedule-data.js"
 
-Then in the app: **Data → Reset to spreadsheet data** (this discards edits made in the app, export JSON first if needed).
+Keep control sheets and generated `data.js` files outside version control. They may be used locally with the build tool, but should not be committed.
 
 ## Rules the app enforces (current + future terms only)
 

@@ -29,6 +29,7 @@ from http.cookiejar import CookieJar
 
 
 ROOT = Path(__file__).resolve().parent
+DATA_FILE = Path(os.environ.get("SCHEDULE_DATA_FILE", "")).expanduser()
 SEARCH_URL = (
     "https://myportal.trine.edu/ICS/default.aspx?portlet=Course_Schedules"
     "&screen=Advanced%20Course%20Search&screenType=next"
@@ -625,10 +626,32 @@ class Handler(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=str(ROOT), **kwargs)
 
     def do_GET(self) -> None:
+        if self.path == "/api/seed-data":
+            self.seed_data()
+            return
         if self.path == "/api/course-search/options":
             self.api(lambda: self.client.options())
             return
         super().do_GET()
+
+    def seed_data(self) -> None:
+        if not DATA_FILE:
+            self.json_response({"available": False})
+            return
+        try:
+            source = DATA_FILE.resolve()
+            if not source.is_file():
+                self.json_response({"available": False})
+                return
+            text = source.read_text(encoding="utf-8")
+            match = re.search(r"window\.SEED\s*=\s*(\{.*\});?\s*$", text, re.S)
+            if not match:
+                raise ValueError("External data file is not a generated Schedule Manager seed")
+            payload = json.loads(match.group(1))
+            self.json_response({"available": True, "seed": payload})
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            print(f"seed-data error: {error}", file=sys.stderr)
+            self.json_response({"error": "Configured schedule data could not be loaded"}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def do_POST(self) -> None:
         if self.path not in {"/api/course-search", "/api/course-availability", "/api/course-enrichment"}:
@@ -679,6 +702,8 @@ def main() -> None:
     parser.add_argument("--port", default=8080, type=int)
     args = parser.parse_args()
     load_env(ROOT / ".env")
+    global DATA_FILE
+    DATA_FILE = Path(os.environ.get("SCHEDULE_DATA_FILE", "")).expanduser()
     try:
         cookie, cookie_source = configured_cookie()
     except ValueError as error:
