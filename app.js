@@ -20,7 +20,7 @@
     c.section = c.section || null;
     return c;
   }
-  const defaultUI = () => ({ tab: 'dashboard', showPast: false, showSummers: false, scopeAll: true, q: '', fStatus: '', fCat: '', sort: 'code', dir: 1, calendarMode: 'month', calendarDate: '' });
+  const defaultUI = () => ({ tab: 'dashboard', showPast: false, showSummers: false, scopeAll: true, q: '', fStatus: '', fCat: '', sort: 'code', dir: 1, calendarMode: 'month', calendarDate: '', calendarTerm: '' });
   function seedState() {
     const sd = structuredClone(window.SEED);
     return { v: 1, meta: sd.meta, minor: sd.minor, courses: sd.courses.map(fixCourse), terms: sd.terms.map((t) => t.id), settings: { ...E.DEFAULTS }, ui: defaultUI() };
@@ -153,10 +153,10 @@
   };
   const dateLabel = (date, options) => date.toLocaleDateString(undefined, options);
   const addDays = (date, amount) => { const next = new Date(date); next.setDate(next.getDate() + amount); return next; };
-  const dayIndex = (date) => (date.getDay() + 6) % 7;
-  const dayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-  const dayCodes = ['M', 'T', 'W', 'R', 'F', 'S', 'U'];
-  const activeSections = (cx) => S.courses.filter((c) => c.term === cx.curId && c.section && c.section.meetings?.length && dateValue(c.section.beginDate) != null && dateValue(c.section.endDate) != null);
+  const dayIndex = (date) => date.getDay();
+  const dayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const dayCodes = ['U', 'M', 'T', 'W', 'R', 'F', 'S'];
+  const scheduledSections = () => S.courses.filter((c) => c.term && c.section && c.section.meetings?.length && dateValue(c.section.beginDate) != null && dateValue(c.section.endDate) != null);
   const eventOnDate = (course, date) => {
     const section = course.section, start = dateValue(section.beginDate), end = dateValue(section.endDate);
     if (!section || start == null || end == null) return false;
@@ -170,10 +170,15 @@
   const eventHtml = (course) => `<button class="calendar-event cat-${esc(course.category)}" data-act="open" data-id="${esc(course.id)}"><b>${esc(course.code)}</b><span>${esc(eventTime(course))}</span></button>`;
 
   function viewCalendar(cx) {
-    const mode = S.ui.calendarMode || 'month', selected = calendarDate(), events = activeSections(cx);
+    const mode = S.ui.calendarMode || 'month', selected = calendarDate();
+    const semesterOptions = [...new Set(scheduledSections().map((course) => course.term))].sort((a, b) => E.tkey(a) - E.tkey(b));
+    const selectedTerm = mode === 'semester' ? (S.ui.calendarTerm === 'all' ? 'all' : semesterOptions.includes(S.ui.calendarTerm) ? S.ui.calendarTerm : (semesterOptions.includes(cx.curId) ? cx.curId : semesterOptions[0] || 'all')) : cx.curId;
+    const events = scheduledSections().filter((course) => selectedTerm === 'all' || course.term === selectedTerm);
     const title = mode === 'day' ? dateLabel(selected, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
-      : mode === 'semester' ? `${tlabel(cx.curId)} · Weekly schedule` : dateLabel(selected, { month: 'long', year: 'numeric' });
-    const controls = `<div class="calendar-tools"><div class="calendar-nav"><button class="btn sm" data-act="calendar-prev" aria-label="Previous period">‹</button><button class="btn sm" data-act="calendar-today">Today</button><button class="btn sm" data-act="calendar-next" aria-label="Next period">›</button></div><strong>${esc(title)}</strong><div class="calendar-modes"><button class="btn sm ${mode === 'day' ? 'primary' : ''}" data-act="calendar-mode" data-mode="day">Day</button><button class="btn sm ${mode === 'month' ? 'primary' : ''}" data-act="calendar-mode" data-mode="month">Month</button><button class="btn sm ${mode === 'semester' ? 'primary' : ''}" data-act="calendar-mode" data-mode="semester">Semester</button></div></div>`;
+      : mode === 'semester' ? `${selectedTerm === 'all' ? 'All semesters' : tlabel(selectedTerm)} · Weekly schedule` : dateLabel(selected, { month: 'long', year: 'numeric' });
+    const termSelect = mode === 'semester' ? `<select class="calendar-term" data-act="calendar-term" aria-label="Semester schedule"><option value="all" ${selectedTerm === 'all' ? 'selected' : ''}>All semesters</option>${semesterOptions.map((term) => `<option value="${term}" ${selectedTerm === term ? 'selected' : ''}>${esc(tlabel(term))}</option>`).join('')}</select>` : '';
+    const semesterNavDisabled = mode === 'semester' && selectedTerm === 'all' ? ' disabled' : '';
+    const controls = `<div class="calendar-tools"><div class="calendar-nav"><button class="btn sm" data-act="calendar-prev" aria-label="Previous ${mode === 'day' ? 'day' : mode === 'month' ? 'month' : 'semester'}"${semesterNavDisabled}>‹</button><button class="btn sm" data-act="calendar-today">Today</button><button class="btn sm" data-act="calendar-next" aria-label="Next ${mode === 'day' ? 'day' : mode === 'month' ? 'month' : 'semester'}"${semesterNavDisabled}>›</button></div><strong>${esc(title)}</strong>${termSelect}<div class="calendar-modes"><button class="btn sm ${mode === 'day' ? 'primary' : ''}" data-act="calendar-mode" data-mode="day">Day</button><button class="btn sm ${mode === 'month' ? 'primary' : ''}" data-act="calendar-mode" data-mode="month">Month</button><button class="btn sm ${mode === 'semester' ? 'primary' : ''}" data-act="calendar-mode" data-mode="semester">Semester</button></div></div>`;
     let body = '';
     if (mode === 'day') {
       const dayEvents = events.filter((course) => eventOnDate(course, selected));
@@ -182,10 +187,11 @@
       const first = new Date(selected.getFullYear(), selected.getMonth(), 1), gridStart = addDays(first, -dayIndex(first));
       body = `<div class="month-grid">${dayLabels.map((label) => `<div class="month-weekday">${label}</div>`).join('')}${Array.from({ length: 42 }, (_, i) => {
         const date = addDays(gridStart, i), outside = date.getMonth() !== selected.getMonth(), dayEvents = events.filter((course) => eventOnDate(course, date));
-        return `<div class="month-cell ${outside ? 'outside' : ''} ${isoDate(date) === isoDate(new Date()) ? 'today' : ''}"><button class="date-number" data-act="calendar-day" data-date="${isoDate(date)}">${date.getDate()}</button>${dayEvents.map(eventHtml).join('')}</div>`;
+        return `<div class="month-cell ${outside ? 'outside' : ''} ${isoDate(date) === isoDate(new Date()) ? 'today' : ''}"><button class="date-number" data-act="calendar-day" data-date="${isoDate(date)}">${date.getDate()}</button><div class="month-events">${dayEvents.map(eventHtml).join('')}</div></div>`;
       }).join('')}</div>`;
     } else {
-      const termStart = new Date(cx.curId.startsWith('FA') ? Number(`20${cx.curId.slice(2)}`) : Number(`20${cx.curId.slice(2)}`), cx.curId.startsWith('SP') ? 0 : 7, 1);
+      const termForStart = selectedTerm !== 'all' ? selectedTerm : cx.curId;
+      const termStart = new Date(Number(`20${termForStart.slice(2)}`), termForStart.startsWith('SP') ? 0 : termForStart.startsWith('SU') ? 5 : 7, 1);
       const firstEvent = events.reduce((min, c) => Math.min(min, dateValue(c.section.beginDate)), Infinity);
       const lastEvent = events.reduce((max, c) => Math.max(max, dateValue(c.section.endDate)), -Infinity);
       const start = Number.isFinite(firstEvent) ? new Date(firstEvent) : termStart, end = Number.isFinite(lastEvent) ? new Date(lastEvent) : addDays(start, 111);
@@ -196,7 +202,7 @@
         return `<div class="semester-week"><div class="week-label">${esc(dateLabel(week, { month: 'short', day: 'numeric' }))}<br><span>${esc(dateLabel(addDays(week, 6), { month: 'short', day: 'numeric' }))}</span></div><div class="week-events">${weekEvents.length ? weekEvents.map(eventHtml).join('') : '<span class="muted">No classes</span>'}</div></div>`;
       }).join('')}</div>`;
     }
-    return `<div class="calendar-page">${controls}<div class="calendar-note">Active semester: ${esc(tlabel(cx.curId))} · ${events.length} scheduled course${events.length === 1 ? '' : 's'}</div>${body}</div>`;
+    return `<div class="calendar-page">${controls}<div class="calendar-note">${mode === 'semester' ? `Showing ${esc(selectedTerm === 'all' ? 'all semesters' : tlabel(selectedTerm))}` : `Showing ${esc(tlabel(cx.curId))}`} · ${events.length} scheduled course${events.length === 1 ? '' : 's'}</div>${body}</div>`;
   }
 
   /* ================= render: shell ================= */
@@ -215,9 +221,9 @@
     };
     $('#tabs').innerHTML = Object.entries(nav).map(([k, [l, d, icon]]) => `<button class="tab" role="tab" data-act="tab" data-tab="${k}" aria-selected="${S.ui.tab === k}"><span class="tab-icon" aria-hidden="true">${icon}</span><span><b>${l}</b></span></button>`).join('');
     const active = nav[S.ui.tab];
-    $('#btn-undo').disabled = !undoStack.length;
     $('#stats').hidden = S.ui.tab !== 'dashboard';
-    renderStats(cx, assign, issues);
+    if (S.ui.tab === 'dashboard') renderStats(cx, assign, issues);
+    else $('#stats').replaceChildren();
     const board = $('.board'); const keep = board ? board.scrollLeft : null;
     $('#view').innerHTML = { dashboard: viewDashboard, timeline: viewPlanner, schedule: viewCalendar, reqs: viewReqs, catalog: viewCatalog }[S.ui.tab](cx, assign, issues);
     const nb = $('.board');
@@ -311,7 +317,7 @@
         <div class="board-tools">
           <div class="timeline-label"><b>Semester timeline</b><span>Drag courses to move them</span></div>
           <div class="tool-group"><label><input type="checkbox" data-act="toggle" data-k="showPast" ${S.ui.showPast ? 'checked' : ''}> Completed</label><label><input type="checkbox" data-act="toggle" data-k="showSummers" ${S.ui.showSummers ? 'checked' : ''}> Summer</label></div>
-          <div class="tool-group tool-actions"><button class="btn sm" data-act="sync-portal" ${portalSyncBusy ? 'disabled' : ''}>${portalSyncBusy ? 'Syncing…' : 'Sync MyPortal'}</button><button class="btn sm" data-act="add-term">+ Term</button></div>
+          <div class="tool-group tool-actions">${undoStack.length ? '<button class="btn sm" data-act="undo">↶ Undo</button>' : ''}<button class="btn sm" data-act="sync-portal" ${portalSyncBusy ? 'disabled' : ''}>${portalSyncBusy ? 'Syncing…' : 'Sync MyPortal'}</button><button class="btn sm" data-act="add-term">+ Term</button></div>
         </div>
         <div class="board">${terms.map((t) => colHtml(t, cx, issues)).join('')}</div>
       </div></div>`;
@@ -430,7 +436,7 @@
         <select data-act="filter" data-k="fStatus"><option value="">All statuses</option>${['done', 'current', 'planned', 'unscheduled'].map((s) => `<option ${fStatus === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
         <select data-act="filter" data-k="fCat"><option value="">All categories</option>${Object.entries(CAT_NAME).map(([k, v]) => `<option value="${k}" ${fCat === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
         <span class="muted" style="align-self:center">${rows.length} of ${S.courses.length} courses</span>
-        <button class="btn primary" data-act="live-search" style="margin-left:auto">Search MyPortal…</button></div>
+        <div class="catalog-actions">${undoStack.length ? '<button class="btn" data-act="undo">↶ Undo</button>' : ''}<button class="btn primary" data-act="live-search">Search MyPortal…</button></div></div>
       <div class="scroll"><table class="t"><thead><tr>${th('code', 'Code')}${th('title', 'Title')}${th('cat', 'Category')}${th('cr', 'Cr')}${th('off', 'Offered')}${th('term', 'Term')}${th('status', 'Status')}${th('grade', 'Grade')}<th>Prerequisites</th>${th('unlocks', 'Unlocks')}<th>Plan</th></tr></thead><tbody>
       ${rows.map((c) => { const st = E.statusOf(cx, c), n = (cx.dependents[c.id] || new Set()).size;
         const locked = st === 'current' && !currentCourseEditable(c, cx);
@@ -916,14 +922,22 @@
       case 'go-schedule':
       case 'go-timeline': S.ui.tab = 'timeline'; save(); render(); break;
       case 'calendar-mode': S.ui.calendarMode = d.mode; save(); render(); break;
-      case 'calendar-today': S.ui.calendarDate = isoDate(new Date()); save(); render(); break;
+      case 'calendar-today':
+        S.ui.calendarDate = isoDate(new Date());
+        if (S.ui.calendarMode === 'semester') S.ui.calendarTerm = LIVE.cx.curId;
+        save(); render(); break;
       case 'calendar-day': S.ui.calendarMode = 'day'; S.ui.calendarDate = d.date; save(); render(); break;
       case 'calendar-prev':
       case 'calendar-next': {
         const amount = act === 'calendar-prev' ? -1 : 1, date = calendarDate();
         if (S.ui.calendarMode === 'day') date.setDate(date.getDate() + amount);
         else if (S.ui.calendarMode === 'month') date.setMonth(date.getMonth() + amount);
-        else date.setFullYear(date.getFullYear() + amount);
+        else {
+          const options = [...new Set(scheduledSections().map((course) => course.term))].sort((a, b) => E.tkey(a) - E.tkey(b));
+          const current = S.ui.calendarTerm === 'all' ? -1 : options.indexOf(S.ui.calendarTerm || LIVE.cx.curId);
+          const next = current + amount;
+          S.ui.calendarTerm = next >= 0 && next < options.length ? options[next] : next === -1 || next === options.length ? 'all' : S.ui.calendarTerm;
+        }
         S.ui.calendarDate = isoDate(date); save(); render(); break;
       }
       case 'undo': undo(); break;
@@ -975,6 +989,7 @@
     const el = e.target.closest('[data-act]'); if (!el) return;
     if (el.dataset.act === 'toggle') { S.ui[el.dataset.k] = el.checked; save(); render(); }
     if (el.dataset.act === 'filter') { S.ui[el.dataset.k] = el.value; save(); render(); }
+    if (el.dataset.act === 'calendar-term') { S.ui.calendarTerm = el.value; save(); render(); }
     if (el.dataset.act === 'scope') { S.ui.scopeAll = el.checked; save(); openOptimizer(); }
   });
   document.addEventListener('input', (e) => {

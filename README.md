@@ -25,7 +25,7 @@ Use **Timeline** to:
 - In **Course catalog**, select **Schedule** or **Reschedule** beside a course to choose its semester without returning to the timeline.
 - Select **×** on a semester to remove it. Any courses in that semester move to **Unscheduled**. You can select **Undo** to restore the semester and its courses.
 
-Use **Schedule** to view the active semester as recurring calendar events. The calendar includes daily, monthly, and semester views. Events use MyPortal meeting days, times, and class start/end dates when available.
+Use **Schedule** to view recurring calendar events. The calendar includes daily, monthly, and semester views. In semester view, choose any semester with scheduled classes or **All semesters** from the selector. Events use MyPortal meeting days, times, and class start/end dates when available.
 
 When you move a course, Schedule recommends an open section that does not overlap the selected sections already in that semester. If every published section overlaps, the move is blocked. You can choose a different section from the course details. Meeting patterns use `R` for Thursday; online session labels distinguish `OL1` and `OL2` when MyPortal provides them.
 

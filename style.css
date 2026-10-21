@@ -19,6 +19,8 @@
   }
 }
 * { box-sizing: border-box; }
+* { scrollbar-width: none; }
+*::-webkit-scrollbar { width: 0; height: 0; }
 html, body { height: 100%; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 var(--sans); overflow: hidden; }
 button, input, select, textarea { font: inherit; color: inherit; }
@@ -54,7 +56,6 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .student-card span { color: #718096; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
 .student-card b { margin-top: 3px; color: #cbd5e1; font-size: 11px; font-weight: 500; line-height: 1.35; }
 .workspace { min-width: 0; min-height: 0; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
-.top { display: flex; justify-content: flex-end; align-items: center; gap: 18px; padding: 10px 20px 8px; }
 .page-heading { min-width: 0; margin-right: auto; }
 .eyebrow { color: var(--accent); font-size: 10px; font-weight: 750; letter-spacing: .1em; text-transform: uppercase; }
 .page-heading h1 { margin: 1px 0 0; font-size: 22px; line-height: 1.2; letter-spacing: -.02em; }
@@ -89,22 +90,24 @@ main { flex: 1; min-height: 0; padding: 0 20px 16px; display: flex; flex-directi
 .calendar-tools { display: flex; align-items: center; gap: 12px; min-height: 36px; }
 .calendar-tools strong { flex: 1; font-size: 15px; font-weight: 650; }
 .calendar-nav, .calendar-modes { display: flex; gap: 4px; }
+.calendar-term { min-width: 150px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel); padding: 4px 7px; }
 .calendar-note { color: var(--muted); font-size: 11px; }
-.month-grid { flex: 1; min-height: 0; display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); grid-template-rows: 28px repeat(6, minmax(78px, 1fr)); border: 1px solid var(--line); background: var(--line); gap: 1px; overflow: auto; }
+.month-grid { flex: 1; min-height: 0; display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); grid-template-rows: 28px repeat(6, minmax(0, 1fr)); border: 1px solid var(--line); background: var(--line); gap: 1px; overflow: hidden; }
 .month-weekday { padding: 6px 8px; background: var(--panel2); color: var(--muted); font-size: 11px; font-weight: 650; text-transform: uppercase; }
-.month-cell { min-width: 0; padding: 5px; background: var(--panel); }
+.month-cell { min-width: 0; min-height: 0; padding: 5px; background: var(--panel); display: flex; flex-direction: column; overflow: hidden; }
 .month-cell.outside { background: var(--panel2); color: var(--muted); }
 .month-cell.today { box-shadow: inset 0 0 0 2px var(--accent); }
 .date-number { border: 0; background: none; color: inherit; padding: 0 3px 4px; font-size: 12px; cursor: pointer; }
 .date-number:hover { color: var(--accent); text-decoration: underline; }
-.calendar-event { display: flex; flex-direction: column; width: 100%; margin: 2px 0; padding: 3px 5px; border: 0; border-left: 3px solid var(--program); border-radius: 3px; background: var(--info-bg); color: var(--ink); text-align: left; cursor: pointer; overflow: hidden; }
+.month-events { min-height: 0; overflow: auto; }
+.calendar-event { display: flex; flex-direction: column; width: 100%; margin: 1px 0; padding: 2px 4px; border: 0; border-left: 2px solid var(--program); border-radius: 2px; background: var(--info-bg); color: var(--ink); text-align: left; cursor: pointer; overflow: hidden; }
 .calendar-event:hover { outline: 1px solid var(--accent); }
 .calendar-event b, .calendar-event span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.calendar-event b { font: 600 10px var(--mono); color: var(--accent); }
-.calendar-event span { font-size: 10px; color: var(--muted); }
-.calendar-day { width: min(620px, 100%); min-height: 180px; padding: 14px; border: 1px solid var(--line); background: var(--panel); }
+.calendar-event b { font: 600 9px var(--mono); color: var(--accent); }
+.calendar-event span { font-size: 9px; color: var(--muted); }
+.calendar-day { flex: 1; width: 100%; min-height: 0; overflow: auto; padding: 14px; border: 1px solid var(--line); background: var(--panel); }
 .calendar-day-label { margin-bottom: 12px; color: var(--muted); font-size: 12px; text-transform: uppercase; }
-.semester-weeks { flex: 1; min-height: 0; overflow: auto; border: 1px solid var(--line); background: var(--line); }
+.semester-weeks { flex: 1; width: 100%; min-height: 0; overflow: auto; border: 1px solid var(--line); background: var(--line); }
 .semester-week { display: grid; grid-template-columns: 105px minmax(0, 1fr); gap: 1px; min-height: 64px; border-bottom: 1px solid var(--line); background: var(--panel); }
 .week-label { padding: 10px; color: var(--ink); font-size: 12px; font-weight: 650; }
 .week-label span { color: var(--muted); font-weight: 400; }
@@ -235,6 +238,7 @@ body.dragging .col.drop-na { opacity: .35; }
 .callout { padding: 9px 12px; border-radius: 8px; background: var(--info-bg); font-size: 13px; margin-bottom: 10px; }
 .callout.warn { background: var(--warn-bg); } .callout.err { background: var(--err-bg); } .callout.ok { background: var(--ok-bg); }
 .filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.catalog-actions { display: flex; gap: 6px; margin-left: auto; }
 .filters input, .filters select, .fld input, .fld select, .fld textarea { background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; }
 table.t { border-collapse: collapse; width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
 .t th, .t td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
@@ -301,7 +305,7 @@ ul.pros li::marker { color: var(--ok); content: "+ "; } ul.cons li::marker { col
 #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%) translateY(20px); background: var(--ink); color: var(--bg); padding: 8px 14px; border-radius: 8px; opacity: 0; pointer-events: none; transition: .2s; z-index: 50; max-width: 90vw; }
 #toast.show { opacity: 1; transform: translateX(-50%); }
 @media (max-width: 1200px) { .stats { grid-template-columns: repeat(3, minmax(140px, 1fr)); } }
-@media print { .sidebar, .top, .stats, .pool, .board-tools, dialog { display: none !important; } .app-layout { display: block; } .workspace { height: auto; } }
+@media print { .sidebar, .stats, .pool, .board-tools, dialog { display: none !important; } .app-layout { display: block; } .workspace { height: auto; } }
 
 @media (max-width: 900px) {
   body { height: auto; min-height: 100%; overflow: auto; }
@@ -317,7 +321,6 @@ ul.pros li::marker { color: var(--ok); content: "+ "; } ul.cons li::marker { col
   .actions { flex: 0 0 auto; flex-direction: row; }
   .sidebar .actions .btn { width: auto; white-space: nowrap; }
   .workspace { height: auto; min-height: calc(100vh - 58px); overflow: visible; }
-  .top { padding: 16px 16px 12px; }
   .stats { padding: 0 16px 12px; }
   main { min-height: auto; padding: 0 16px 16px; }
   .planner { display: flex; flex-direction: column; }
@@ -335,10 +338,11 @@ ul.pros li::marker { color: var(--ok); content: "+ "; } ul.cons li::marker { col
   .page-heading h1 { font-size: 21px; }
   .page-heading p { display: none; }
   .board-tools .muted { display: none; }
+  .catalog-actions { width: 100%; margin-left: 0; }
   .calendar-tools { flex-wrap: wrap; }
   .calendar-tools strong { order: -1; flex-basis: 100%; }
   .calendar-modes { margin-left: auto; }
-  .month-grid { grid-template-rows: 26px repeat(6, minmax(62px, 1fr)); }
+  .month-grid { grid-template-rows: 26px repeat(6, minmax(0, 1fr)); }
   .month-cell { padding: 3px; }
   .calendar-event span { display: none; }
   .semester-week { grid-template-columns: 78px minmax(0, 1fr); }
