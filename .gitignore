@@ -1,0 +1,6 @@
+.env
+myportal-cookies.json
+cookies.json
+*_cookies.json
+__pycache__/
+*.pyc

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Schedule Manager</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f5de8'/%3E%3Cpath d='M8 11h16M8 16h16M8 21h10' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+</head>
+<body>
+<div class="app-layout">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">SM</span>
+      <span><b>Schedule Manager</b><small>Degree planning workspace</small></span>
+    </div>
+    <div class="nav-label">Workspace</div>
+    <nav class="tabs" id="tabs" role="tablist" aria-label="Workspace views"></nav>
+    <div class="sidebar-spacer"></div>
+    <div class="nav-label">Plan tools</div>
+    <div class="actions">
+      <button class="btn primary" data-act="optimize"><span aria-hidden="true">✦</span><span class="action-label">Optimize plan</span></button>
+      <button class="btn" data-act="settings"><span aria-hidden="true">⚙</span><span class="action-label">Settings</span></button>
+      <button class="btn" data-act="data"><span aria-hidden="true">↕</span><span class="action-label">Data &amp; backup</span></button>
+    </div>
+    <div class="student-card"><span>Student plan</span><b id="subtitle"></b></div>
+  </aside>
+
+  <section class="workspace">
+    <header class="top">
+      <div class="page-heading">
+        <span class="eyebrow">Academic roadmap</span>
+        <h1 id="page-title">Plan timeline</h1>
+        <p id="page-description">Arrange courses by semester and resolve scheduling conflicts.</p>
+      </div>
+      <button class="btn" data-act="undo" id="btn-undo" title="Undo last change (Ctrl+Z)">↶ Undo</button>
+    </header>
+    <section class="stats" id="stats" aria-label="Plan summary"></section>
+    <main id="view"></main>
+  </section>
+</div>
+
+<dialog id="dlg"></dialog>
+<div id="toast" role="status" aria-live="polite"></div>
+<input type="file" id="file-import" accept="application/json,.json" hidden>
+
+<noscript>This app needs JavaScript.</noscript>
+<script src="data.js"></script>
+<script src="engine.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
