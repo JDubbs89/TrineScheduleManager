@@ -20,17 +20,29 @@
     c.section = c.section || null;
     return c;
   }
-  const defaultUI = () => ({ tab: 'dashboard', showPast: false, showSummers: false, scopeAll: true, q: '', fStatus: '', fCat: '', sort: 'code', dir: 1 });
+  const defaultUI = () => ({ tab: 'dashboard', showPast: false, showSummers: false, scopeAll: true, q: '', fStatus: '', fCat: '', sort: 'code', dir: 1, calendarMode: 'month', calendarDate: '' });
   function seedState() {
     const sd = structuredClone(window.SEED);
     return { v: 1, meta: sd.meta, minor: sd.minor, courses: sd.courses.map(fixCourse), terms: sd.terms.map((t) => t.id), settings: { ...E.DEFAULTS }, ui: defaultUI() };
+  }
+  function blankState() {
+    const current = E.currentTermId(E.DEFAULTS);
+    return {
+      v: 1,
+      meta: { student: 'New plan', program: 'Custom schedule', source: 'blank plan' },
+      minor: null,
+      courses: [],
+      terms: [current],
+      settings: { ...E.DEFAULTS },
+      ui: defaultUI(),
+    };
   }
   function loadState() {
     try {
       const o = JSON.parse(localStorage.getItem(KEY) || 'null');
       if (o && Array.isArray(o.courses) && Array.isArray(o.terms)) {
         o.courses.forEach(fixCourse); o.settings = { ...E.DEFAULTS, ...o.settings }; o.ui = { ...defaultUI(), ...o.ui };
-        if (o.ui.tab === 'planner') o.ui.tab = 'schedule';
+        if (o.ui.tab === 'planner' || o.ui.tab === 'schedule') o.ui.tab = 'timeline';
         return o;
       }
     } catch (e) { /* storage blocked or corrupt: fall through to seed */ }
@@ -128,6 +140,65 @@
     document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 500);
   }
 
+  const calendarDate = () => {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(S.ui.calendarDate || '')) {
+      const date = new Date(`${S.ui.calendarDate}T12:00:00`);
+      if (!Number.isNaN(date.getTime())) return date;
+    }
+    return new Date();
+  };
+  const isoDate = (date) => {
+    const y = date.getFullYear(), m = String(date.getMonth() + 1).padStart(2, '0'), d = String(date.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  };
+  const dateLabel = (date, options) => date.toLocaleDateString(undefined, options);
+  const addDays = (date, amount) => { const next = new Date(date); next.setDate(next.getDate() + amount); return next; };
+  const dayIndex = (date) => (date.getDay() + 6) % 7;
+  const dayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const dayCodes = ['M', 'T', 'W', 'R', 'F', 'S', 'U'];
+  const activeSections = (cx) => S.courses.filter((c) => c.term === cx.curId && c.section && c.section.meetings?.length && dateValue(c.section.beginDate) != null && dateValue(c.section.endDate) != null);
+  const eventOnDate = (course, date) => {
+    const section = course.section, start = dateValue(section.beginDate), end = dateValue(section.endDate);
+    if (!section || start == null || end == null) return false;
+    const value = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+    return value >= start && value <= end && (section.meetings || []).some((meeting) => meeting.days.some((day) => dayCodes[dayIndex(date)] === day));
+  };
+  const eventTime = (course) => {
+    const meeting = course.section?.meetings?.[0];
+    return meeting ? `${meeting.startLabel}–${meeting.endLabel}` : course.section?.timeLabel || 'Time TBA';
+  };
+  const eventHtml = (course) => `<button class="calendar-event cat-${esc(course.category)}" data-act="open" data-id="${esc(course.id)}"><b>${esc(course.code)}</b><span>${esc(eventTime(course))}</span></button>`;
+
+  function viewCalendar(cx) {
+    const mode = S.ui.calendarMode || 'month', selected = calendarDate(), events = activeSections(cx);
+    const title = mode === 'day' ? dateLabel(selected, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
+      : mode === 'semester' ? `${tlabel(cx.curId)} · Weekly schedule` : dateLabel(selected, { month: 'long', year: 'numeric' });
+    const controls = `<div class="calendar-tools"><div class="calendar-nav"><button class="btn sm" data-act="calendar-prev" aria-label="Previous period">‹</button><button class="btn sm" data-act="calendar-today">Today</button><button class="btn sm" data-act="calendar-next" aria-label="Next period">›</button></div><strong>${esc(title)}</strong><div class="calendar-modes"><button class="btn sm ${mode === 'day' ? 'primary' : ''}" data-act="calendar-mode" data-mode="day">Day</button><button class="btn sm ${mode === 'month' ? 'primary' : ''}" data-act="calendar-mode" data-mode="month">Month</button><button class="btn sm ${mode === 'semester' ? 'primary' : ''}" data-act="calendar-mode" data-mode="semester">Semester</button></div></div>`;
+    let body = '';
+    if (mode === 'day') {
+      const dayEvents = events.filter((course) => eventOnDate(course, selected));
+      body = `<div class="calendar-day"><div class="calendar-day-label">${esc(dateLabel(selected, { weekday: 'long' }))}</div>${dayEvents.length ? dayEvents.map(eventHtml).join('') : '<div class="empty">No scheduled classes on this day.</div>'}</div>`;
+    } else if (mode === 'month') {
+      const first = new Date(selected.getFullYear(), selected.getMonth(), 1), gridStart = addDays(first, -dayIndex(first));
+      body = `<div class="month-grid">${dayLabels.map((label) => `<div class="month-weekday">${label}</div>`).join('')}${Array.from({ length: 42 }, (_, i) => {
+        const date = addDays(gridStart, i), outside = date.getMonth() !== selected.getMonth(), dayEvents = events.filter((course) => eventOnDate(course, date));
+        return `<div class="month-cell ${outside ? 'outside' : ''} ${isoDate(date) === isoDate(new Date()) ? 'today' : ''}"><button class="date-number" data-act="calendar-day" data-date="${isoDate(date)}">${date.getDate()}</button>${dayEvents.map(eventHtml).join('')}</div>`;
+      }).join('')}</div>`;
+    } else {
+      const termStart = new Date(cx.curId.startsWith('FA') ? Number(`20${cx.curId.slice(2)}`) : Number(`20${cx.curId.slice(2)}`), cx.curId.startsWith('SP') ? 0 : 7, 1);
+      const firstEvent = events.reduce((min, c) => Math.min(min, dateValue(c.section.beginDate)), Infinity);
+      const lastEvent = events.reduce((max, c) => Math.max(max, dateValue(c.section.endDate)), -Infinity);
+      const start = Number.isFinite(firstEvent) ? new Date(firstEvent) : termStart, end = Number.isFinite(lastEvent) ? new Date(lastEvent) : addDays(start, 111);
+      const weeks = [];
+      for (let cursor = addDays(start, -dayIndex(start)); cursor <= end; cursor = addDays(cursor, 7)) weeks.push(cursor);
+      body = `<div class="semester-weeks">${weeks.map((week) => {
+        const dates = Array.from({ length: 7 }, (_, i) => addDays(week, i)), weekEvents = events.filter((course) => dates.some((date) => eventOnDate(course, date)));
+        return `<div class="semester-week"><div class="week-label">${esc(dateLabel(week, { month: 'short', day: 'numeric' }))}<br><span>${esc(dateLabel(addDays(week, 6), { month: 'short', day: 'numeric' }))}</span></div><div class="week-events">${weekEvents.length ? weekEvents.map(eventHtml).join('') : '<span class="muted">No classes</span>'}</div></div>`;
+      }).join('')}</div>`;
+    }
+    return `<div class="calendar-page">${controls}<div class="calendar-note">Active semester: ${esc(tlabel(cx.curId))} · ${events.length} scheduled course${events.length === 1 ? '' : 's'}</div>${body}</div>`;
+  }
+
   /* ================= render: shell ================= */
   function render() {
     const cx = ctx(), assign = E.currentAssign(cx), issues = E.computeIssues(cx, assign);
@@ -135,21 +206,20 @@
     issues.all.push(...timing.all);
     for (const [id, rows] of Object.entries(timing.byCourse)) (issues.byCourse[id] ||= []).push(...rows);
     LIVE = { cx, issues };
-    $('#subtitle').textContent = [S.meta.student, S.meta.program, S.meta.minorLabel].filter(Boolean).join(' · ');
     const nav = {
-      dashboard: ['Dashboard', 'Review progress, risks, and your academic roadmap', '▦'],
-      schedule: ['Schedule', 'Choose semesters, sections, days, and times', '◫'],
-      reqs: ['Requirements', 'Track degree progress and bottlenecks', '✓'],
-      catalog: ['Course catalog', 'Review and search every course', '⌕'],
+      dashboard: ['Dashboard', 'Plan overview', '▦'],
+      timeline: ['Timeline', 'Courses by term', '◫'],
+      schedule: ['Schedule', 'Calendar view', '□'],
+      reqs: ['Requirements', 'Degree progress', '✓'],
+      catalog: ['Course catalog', 'Find and edit courses', '⌕'],
     };
-    $('#tabs').innerHTML = Object.entries(nav).map(([k, [l, d, icon]]) => `<button class="tab" role="tab" data-act="tab" data-tab="${k}" aria-selected="${S.ui.tab === k}"><span class="tab-icon" aria-hidden="true">${icon}</span><span><b>${l}</b><small>${d}</small></span></button>`).join('');
+    $('#tabs').innerHTML = Object.entries(nav).map(([k, [l, d, icon]]) => `<button class="tab" role="tab" data-act="tab" data-tab="${k}" aria-selected="${S.ui.tab === k}"><span class="tab-icon" aria-hidden="true">${icon}</span><span><b>${l}</b></span></button>`).join('');
     const active = nav[S.ui.tab];
-    $('#page-title').textContent = active[0]; $('#page-description').textContent = active[1] + '.';
     $('#btn-undo').disabled = !undoStack.length;
     $('#stats').hidden = S.ui.tab !== 'dashboard';
     renderStats(cx, assign, issues);
     const board = $('.board'); const keep = board ? board.scrollLeft : null;
-    $('#view').innerHTML = { dashboard: viewDashboard, schedule: viewPlanner, reqs: viewReqs, catalog: viewCatalog }[S.ui.tab](cx, assign, issues);
+    $('#view').innerHTML = { dashboard: viewDashboard, timeline: viewPlanner, schedule: viewCalendar, reqs: viewReqs, catalog: viewCatalog }[S.ui.tab](cx, assign, issues);
     const nb = $('.board');
     if (nb) {
       if (keep != null && !firstRender) nb.scrollLeft = keep;
@@ -239,12 +309,9 @@
     return `<div class="planner">${poolHtml(cx, assign, issues)}
       <div class="board-wrap">
         <div class="board-tools">
-          <div class="timeline-label"><b>Semester timeline</b><span>Drag courses to reschedule</span></div>
-          <label><input type="checkbox" data-act="toggle" data-k="showPast" ${S.ui.showPast ? 'checked' : ''}> Completed terms</label>
-          <label><input type="checkbox" data-act="toggle" data-k="showSummers" ${S.ui.showSummers ? 'checked' : ''}> Summer terms</label>
-          <button class="btn sm" data-act="sync-portal" ${portalSyncBusy ? 'disabled' : ''}>${portalSyncBusy ? 'Syncing…' : 'Sync MyPortal'}</button>
-          <span class="muted">R = Thursday · drag cards between terms</span>
-          <button class="btn sm" data-act="add-term">+ Term</button>
+          <div class="timeline-label"><b>Semester timeline</b><span>Drag courses to move them</span></div>
+          <div class="tool-group"><label><input type="checkbox" data-act="toggle" data-k="showPast" ${S.ui.showPast ? 'checked' : ''}> Completed</label><label><input type="checkbox" data-act="toggle" data-k="showSummers" ${S.ui.showSummers ? 'checked' : ''}> Summer</label></div>
+          <div class="tool-group tool-actions"><button class="btn sm" data-act="sync-portal" ${portalSyncBusy ? 'disabled' : ''}>${portalSyncBusy ? 'Syncing…' : 'Sync MyPortal'}</button><button class="btn sm" data-act="add-term">+ Term</button></div>
         </div>
         <div class="board">${terms.map((t) => colHtml(t, cx, issues)).join('')}</div>
       </div></div>`;
@@ -262,14 +329,14 @@
     const clashes = scheduleIssues().all.length;
     const syncText = S.meta.portalSyncedAt ? `Last synced ${new Date(S.meta.portalSyncedAt).toLocaleString()}` : 'MyPortal has not been synced yet';
     return `<div class="dashboard-grid">
-      <section class="panel dashboard-roadmap"><div class="dashboard-panel-head"><div><h3>Academic roadmap</h3><span class="muted">A compact view of your upcoming schedule</span></div><button class="btn primary" data-act="go-schedule">Open schedule</button></div><div class="compact-timeline">${upcoming || '<div class="empty">Add a future term to start planning.</div>'}</div></section>
-      <section class="panel dashboard-attention"><h3>Planning attention</h3>
-        <button class="attention-row" data-act="go-schedule"><span>Unscheduled courses</span><b class="${unscheduled ? 'warn-text' : ''}">${unscheduled}</b></button>
+      <section class="panel dashboard-roadmap"><div class="dashboard-panel-head"><div><h3>Upcoming terms</h3><span class="muted">Your courses by semester</span></div><button class="btn primary" data-act="go-timeline">View timeline</button></div><div class="compact-timeline">${upcoming || '<div class="empty">Add a term to start planning.</div>'}</div></section>
+      <section class="panel dashboard-attention"><h3>Things to review</h3>
+        <button class="attention-row" data-act="go-timeline"><span>Unscheduled courses</span><b class="${unscheduled ? 'warn-text' : ''}">${unscheduled}</b></button>
         <button class="attention-row" data-act="issues"><span>Schedule overlaps</span><b class="${clashes ? 'err-text' : ''}">${clashes}</b></button>
-        <button class="attention-row" data-act="go-schedule"><span>Spreadsheet fallbacks</span><b>${fallback}</b></button>
+        <button class="attention-row" data-act="go-timeline"><span>Spreadsheet fallbacks</span><b>${fallback}</b></button>
         <div class="callout ${clashes ? 'err' : 'ok'}">${clashes ? 'Resolve overlapping meeting times before finalizing registration.' : 'No selected sections overlap.'}</div>
       </section>
-      <section class="panel dashboard-sync"><div class="dashboard-panel-head"><div><h3>MyPortal sections</h3><span class="muted">${esc(syncText)}</span></div><button class="btn" data-act="sync-portal" ${portalSyncBusy ? 'disabled' : ''}>${portalSyncBusy ? 'Syncing…' : 'Refresh data'}</button></div><p class="muted">Published sections, OL1/OL2 sessions, meeting patterns, times, seats, and class dates are matched to spreadsheet courses. Missing listings retain spreadsheet data.</p></section>
+      <section class="panel dashboard-sync"><div class="dashboard-panel-head"><div><h3>MyPortal data</h3><span class="muted">${esc(syncText)}</span></div><button class="btn" data-act="sync-portal" ${portalSyncBusy ? 'disabled' : ''}>${portalSyncBusy ? 'Syncing…' : 'Refresh'}</button></div><p class="muted">Refresh published sections and meeting details for your courses.</p></section>
     </div>`;
   }
 
@@ -433,8 +500,17 @@
     }).join('');
     const sectionBlock = c.term && c.term !== 'TR' ? `<div class="form-section-title fld full"><span>Class schedule</span></div>
       ${termSections.length ? `<label class="fld full"><span>MyPortal section</span>${scheduleLocked ? `<input type="hidden" name="section" value="${esc(sectionKey(c.section))}">` : ''}<select name="section" ${scheduleLocked ? 'disabled' : ''}><option value="">Recommend a conflict-free section</option>${sectionOptions}</select><small>${scheduleLocked ? 'This section has already started, so its semester and section are locked.' : 'R means Thursday. Saving a changed term recommends a non-overlapping section automatically.'}</small></label>`
-        : `<div class="callout warn fld full"><b>${portalTerm?.source === 'spreadsheet' ? 'Spreadsheet fallback' : 'Section data not loaded'}</b><br>${portalTerm?.source === 'spreadsheet' ? 'This course is not listed in MyPortal for this semester, so its spreadsheet information is retained.' : 'Sync MyPortal from the Schedule tab to load sections, dates, days, and times.'}</div>`}
+        : `<div class="callout warn fld full"><b>${portalTerm?.source === 'spreadsheet' ? 'Spreadsheet fallback' : 'Section data not loaded'}</b><br>${portalTerm?.source === 'spreadsheet' ? 'This course is not listed in MyPortal for this semester, so its spreadsheet information is retained.' : 'Sync MyPortal from the Timeline tab to load sections, dates, days, and times.'}</div>`}
       ${c.section ? `<div class="course-facts fld full"><div><span>Section</span><b>${esc(c.section.onlineSession || c.section.sectionCode || '—')}</b></div><div><span>Days</span><b>${esc(c.section.daysLabel || 'Online/TBA')}</b></div><div><span>Time</span><b>${esc(c.section.timeLabel || 'Asynchronous/TBA')}</b></div><div><span>Class dates</span><b>${esc(c.section.beginDate || '—')}–${esc(c.section.endDate || '—')}</b></div></div>` : ''}` : '';
+    const portalTerms = Object.entries(c.portal?.byTerm || {}).sort(([a], [b]) => E.tkey(a) - E.tkey(b));
+    const portalOverview = portalTerms.length > 1 ? `<div class="form-section-title fld full"><span>Published MyPortal terms</span></div>
+      <div class="portal-term-list fld full">${portalTerms.map(([term, data]) => {
+        const sections = data.sections || [];
+        const details = sections.length
+          ? sections.map((section) => esc([section.onlineSession || section.sectionCode, section.daysLabel, section.timeLabel, `${section.beginDate}–${section.endDate}`].filter(Boolean).join(' · '))).join('<br>')
+          : data.source === 'spreadsheet' ? 'Not published; spreadsheet data retained' : 'Not listed in this published term';
+        return `<div class="portal-term-row"><b>${esc(data.termLabel || tlabel(term))}</b><span>${details}</span></div>`;
+      }).join('')}</div>` : '';
     const body = `<form class="form" data-form="course" autocomplete="off">
       ${myIssues.length ? `<div class="callout err fld full">${myIssues.map((i) => esc(i.msg)).join('<br>')}</div>` : ''}
       <div class="course-facts fld full"><div><span>Status</span><b>${esc(st)}</b></div><div><span>Credits</span><b>${c.credits}</b></div><div><span>Offered</span><b>${esc(c.offered ? OFF_NAME[c.offered] || c.offered : 'Unknown')}</b></div><div><span>Category</span><b>${esc(CAT_NAME[c.category] || c.category)}</b></div></div>
@@ -448,6 +524,7 @@
       <label class="fld"><span>Category</span><select name="category">${['gened', 'program', 'elective'].map((k) => `<option value="${k}" ${c.category === k ? 'selected' : ''}>${CAT_NAME[k]}</option>`).join('')}</select></label>
       <label class="fld check"><input type="checkbox" name="locked" ${c.locked ? 'checked' : ''}><span>Pin to this term (optimizer won't move it)</span></label>
       ${sectionBlock}
+      ${portalOverview}
       <div class="form-section-title fld full"><span>Requirements</span></div>
       <label class="fld full"><span>Prerequisites (text)</span><input name="prereq" value="${esc(c.prereqText)}" placeholder='e.g. "C" or better in MA 164 · CS 1123 or ECE 273 · SE 153, SE 233 · Sr. Standing'>
         <small>Parsed on save. Codes not in your catalog count as met (placement / transfer).</small></label>
@@ -691,7 +768,8 @@
   function openData() {
     openDlg(dlgShell('Data', `<p class="muted">Everything is stored in this browser (localStorage). Export a JSON backup to move it between devices or browsers.</p>
       <div class="row"><span class="grow"><b>Backup</b><br><span class="muted">Full state: courses, terms, settings</span></span><button class="btn" data-act="export-json">Export JSON</button><button class="btn" data-act="import-json">Import JSON…</button></div>
-      <div class="row"><span class="grow"><b>Schedule as CSV</b><br><span class="muted">One row per course, for spreadsheets</span></span><button class="btn" data-act="export-csv">Export CSV</button></div>
+      <div class="row"><span class="grow"><b>Schedule as CSV</b><br><span class="muted">One row per course. Code and Title are required; Term may be an ID such as FA26 or a label such as Fall 2026.</span></span><button class="btn" data-act="export-csv">Export CSV</button><button class="btn" data-act="import-csv">Import CSV…</button></div>
+      <div class="row"><span class="grow"><b>Start a blank schedule</b><br><span class="muted">Removes the spreadsheet courses and starts with the current semester.</span></span><button class="btn danger" data-act="blank">Create blank…</button></div>
       <div class="row"><span class="grow"><b>Reset to spreadsheet data</b><br><span class="muted">Discards all edits and reloads data.js (${esc(S.meta.source || 'seed')})</span></span><button class="btn danger" data-act="reset">Reset…</button></div>`));
   }
   function exportCsv() {
@@ -699,6 +777,54 @@
     const rows = [['Term', 'Code', 'Title', 'Credits', 'Grade', 'Status', 'Category', 'Offered', 'Section', 'Days', 'Time', 'Time of day', 'Class start', 'Class end', 'Source', 'Prerequisites'], ...[...S.courses].sort((a, b) => (a.term ? E.tkey(a.term) : 1e9) - (b.term ? E.tkey(b.term) : 1e9) || cmpCode(a, b))
       .map((c) => [tlabel(c.term), c.code, c.title, c.credits, c.grade || '', E.statusOf(cx, c), CAT_NAME[c.category] || c.category, c.offered || '', c.section?.onlineSession || c.section?.sectionCode || '', c.section?.daysLabel || '', c.section?.timeLabel || '', c.section?.timeOfDay || '', c.section?.beginDate || '', c.section?.endDate || '', c.term ? c.portal?.byTerm?.[c.term]?.source || 'spreadsheet' : 'spreadsheet', c.prereqText])];
     download('schedule.csv', rows.map((r) => r.map(q).join(',')).join('\n'), 'text/csv');
+  }
+  function parseCsv(text) {
+    const rows = [], row = [], field = [];
+    let quoted = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i], next = text[i + 1];
+      if (ch === '"') {
+        if (quoted && next === '"') { field.push('"'); i++; } else quoted = !quoted;
+      } else if (ch === ',' && !quoted) { row.push(field.join('')); field.length = 0; }
+      else if ((ch === '\n' || ch === '\r') && !quoted) {
+        if (ch === '\r' && next === '\n') i++;
+        row.push(field.join('')); field.length = 0;
+        if (row.some((value) => value.trim())) rows.push(row.splice(0));
+      } else field.push(ch);
+    }
+    if (field.length || row.length) { row.push(field.join('')); if (row.some((value) => value.trim())) rows.push(row); }
+    if (rows.length < 2) throw new Error('CSV must include a header and at least one course');
+    const headers = rows.shift().map((value) => value.trim().toLowerCase());
+    const index = (names) => names.map((name) => headers.indexOf(name)).find((value) => value >= 0);
+    const codeAt = index(['code', 'course code']);
+    const titleAt = index(['title', 'course title', 'name']);
+    if (codeAt == null || titleAt == null) throw new Error('CSV must have Code and Title columns');
+    const at = (values, names) => { const i = index(names); return i == null ? '' : (values[i] || '').trim(); };
+    const termId = (value) => {
+      const raw = value.trim().toUpperCase();
+      if (/^(FA|SP|SU)\d{2}$/.test(raw) || raw === 'TR') return raw;
+      const match = /^(FALL|SPRING|SUMMER)\s+(\d{4})$/.exec(raw);
+      return match ? ({ FALL: 'FA', SPRING: 'SP', SUMMER: 'SU' }[match[1]] + match[2].slice(-2)) : null;
+    };
+    const used = new Set(S.courses.map((c) => c.id));
+    return rows.map((values, rowIndex) => {
+      const code = values[codeAt].trim().toUpperCase().replace(/\s+/g, ' ');
+      const title = values[titleAt].trim();
+      if (!code || !title) throw new Error(`CSV row ${rowIndex + 2} needs both Code and Title`);
+      const base = `csv-${code.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+      let id = base, suffix = 2;
+      while (used.has(id)) id = `${base}-${suffix++}`;
+      used.add(id);
+      const term = termId(at(values, ['term', 'semester']));
+      if (at(values, ['term', 'semester']) && !term) throw new Error(`CSV row ${rowIndex + 2} has an invalid term`);
+      const credits = Number(at(values, ['credits', 'credit hours'])) || 0;
+      return fixCourse({
+        id, code, title, credits: Math.max(0, Math.min(12, credits)), grade: at(values, ['grade']) || null,
+        category: (at(values, ['category']) || 'program').toLowerCase(), offered: at(values, ['offered']) || null,
+        prereqText: at(values, ['prerequisites', 'prerequisite']), prereq: E.parsePrereq(at(values, ['prerequisites', 'prerequisite'])),
+        notes: at(values, ['notes']), term, custom: true,
+      });
+    });
   }
 
   function openIssues() {
@@ -743,7 +869,7 @@
     const body = `<div class="callout">Scenarios place courses so every offering, prerequisite, minimum-grade, standing and credit-limit rule holds. They respect pins, completed terms and the current term.
       <label style="display:flex;gap:6px;margin-top:6px;cursor:pointer"><input type="checkbox" data-act="scope" ${S.ui.scopeAll ? 'checked' : ''}> Re-plan future terms (uncheck to place only unscheduled courses and leave everything else where it is)</label></div>
       ${scenarios.length ? '' : '<div class="callout warn">No feasible schedule within 14 terms. Check Settings (max load, summer availability) or pinned courses.</div>'}
-      <div class="scen-grid">${scenCard('Current plan', 'What you have now', base, bi, null, null)}
+      <div class="scen-grid">${scenCard('Current plan', 'Current schedule', base, bi, null, null)}
       ${scenarios.map((sc, i) => scenCard(sc.title, sc.blurb, sc.plan.stats, E.computeIssues(sc.plan.ctx, sc.plan.assign).all.length, proscons(sc, base), i, sc.plan.pending.every((c) => sc.plan.assign[c.id] === c.term))).join('')}</div>
       <p class="muted">${pend} course(s) are movable. Summer bars are orange. Greedy scheduler: longest prerequisite chains first, then terms-restricted courses.</p>`;
     openDlg(dlgShell('Optimize schedule', body), true);
@@ -781,12 +907,25 @@
   }
   document.addEventListener('click', (e) => {
     const el = e.target.closest('[data-act]'); if (!el) return;
+    if (el instanceof HTMLButtonElement) e.preventDefault();
     if (el.matches('input, select')) return; // handled by change/input events
     if (e.target.closest('.slot.bad')) return;
     const act = el.dataset.act, d = el.dataset;
     switch (act) {
       case 'tab': S.ui.tab = d.tab; save(); render(); break;
-      case 'go-schedule': S.ui.tab = 'schedule'; save(); render(); break;
+      case 'go-schedule':
+      case 'go-timeline': S.ui.tab = 'timeline'; save(); render(); break;
+      case 'calendar-mode': S.ui.calendarMode = d.mode; save(); render(); break;
+      case 'calendar-today': S.ui.calendarDate = isoDate(new Date()); save(); render(); break;
+      case 'calendar-day': S.ui.calendarMode = 'day'; S.ui.calendarDate = d.date; save(); render(); break;
+      case 'calendar-prev':
+      case 'calendar-next': {
+        const amount = act === 'calendar-prev' ? -1 : 1, date = calendarDate();
+        if (S.ui.calendarMode === 'day') date.setDate(date.getDate() + amount);
+        else if (S.ui.calendarMode === 'month') date.setMonth(date.getMonth() + amount);
+        else date.setFullYear(date.getFullYear() + amount);
+        S.ui.calendarDate = isoDate(date); save(); render(); break;
+      }
       case 'undo': undo(); break;
       case 'optimize': openOptimizer(); break;
       case 'settings': openSettings(); break;
@@ -821,9 +960,11 @@
       case 'apply': applyScenario(Number(d.i)); break;
       case 'sort': S.ui.dir = S.ui.sort === d.k ? -S.ui.dir : 1; S.ui.sort = d.k; save(); render(); break;
       case 'export-json': download('schedule-backup.json', JSON.stringify({ app: 'schedule-manager', v: S.v, meta: S.meta, minor: S.minor, courses: S.courses, terms: S.terms, settings: S.settings }, null, 1)); break;
-      case 'import-json': $('#file-import').click(); break;
+      case 'import-json':
+      case 'import-csv': $('#file-import').dataset.format = act === 'import-csv' ? 'csv' : 'json'; $('#file-import').click(); break;
       case 'export-csv': exportCsv(); break;
       case 'reset': if (confirm('Discard all edits and reload the spreadsheet data?')) { undoStack = []; S = seedState(); normalizeTerms(); save(); closeDlg(); render(); toast('Reset to spreadsheet data'); } break;
+      case 'blank': if (confirm('Discard this plan and start a blank schedule? Export a backup first if you need these courses later.')) { undoStack = []; S = blankState(); save(); closeDlg(); render(); toast('Blank schedule created'); } break;
     }
   });
   document.addEventListener('keydown', (e) => {
@@ -844,10 +985,20 @@
   $('#file-import').addEventListener('change', async (e) => {
     const f = e.target.files[0]; e.target.value = ''; if (!f) return;
     try {
-      const o = JSON.parse(await f.text());
-      if (!Array.isArray(o.courses) || !Array.isArray(o.terms)) throw new Error('Not a schedule backup');
-      mutate(() => { S.courses = o.courses.map(fixCourse); S.terms = o.terms.map((t) => t.id || t); S.settings = { ...E.DEFAULTS, ...o.settings }; if (o.meta) S.meta = o.meta; if (o.minor) S.minor = o.minor; });
-      closeDlg(); toast('Backup imported. Undo is available');
+      const text = await f.text();
+      if ($('#file-import').dataset.format === 'csv' || /\.csv$/i.test(f.name)) {
+        const imported = parseCsv(text);
+        mutate(() => {
+          S.courses.push(...imported);
+          imported.forEach((c) => { if (c.term && !S.terms.includes(c.term)) S.terms.push(c.term); });
+        });
+        closeDlg(); toast(`${imported.length} course${imported.length === 1 ? '' : 's'} imported. Undo is available`);
+      } else {
+        const o = JSON.parse(text);
+        if (!Array.isArray(o.courses) || !Array.isArray(o.terms)) throw new Error('Not a schedule backup');
+        mutate(() => { S.courses = o.courses.map(fixCourse); S.terms = o.terms.map((t) => t.id || t); S.settings = { ...E.DEFAULTS, ...o.settings }; if (o.meta) S.meta = o.meta; if (o.minor) S.minor = o.minor; });
+        closeDlg(); toast('Backup imported. Undo is available');
+      }
     } catch (err) { toast('Import failed: ' + err.message); }
   });
 

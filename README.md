@@ -1,6 +1,6 @@
 # Schedule Manager
 
-Dependency-free degree planner built from your BSCS control sheet. It includes a small Python server for live MyPortal course search; planner data still stays in your browser.
+A local schedule planner for Trine students. Use it to organize courses by term, check conflicts, track requirements, and review published MyPortal sections without sending your planning data to a hosted service.
 
 ## Run it
 
@@ -10,17 +10,22 @@ Dependency-free degree planner built from your BSCS control sheet. It includes a
 The planner itself still works from any static host (or `file://` in most browsers), but **Search MyPortal** requires `server.py` so the remote request can be made without exposing a session cookie to browser JavaScript.
 
 State is stored in the browser (localStorage, per origin). Use **Data → Export JSON** to back up or move between devices.
+Use **Data → Create blank** to start without the spreadsheet, or **Import CSV** to add courses from a file with `Code` and `Title` columns. Optional columns include `Term`, `Credits`, `Grade`, `Category`, `Offered`, `Prerequisites`, and `Notes`. Terms may be IDs such as `FA26` or labels such as `Fall 2026`.
 
-## Plan your schedule
+## Use the planner
 
-Use the sidebar to switch between **Dashboard**, **Schedule**, **Requirements**, and **Course catalog**. The Dashboard shows plan metrics and a compact roadmap. Use Schedule to:
+Use the sidebar to switch between **Dashboard**, **Timeline**, **Schedule**, **Requirements**, and **Course catalog**.
+
+Use **Timeline** to:
 
 - Drag a course to another semester or back to **Unscheduled**.
 - Select a course card to review its term, section, class dates, days, time, prerequisites, dependencies, grade, and notes.
 - Select **MyPortal** on a course card to check every published current or future semester.
-- Select **Sync MyPortal** to match each spreadsheet course to its published section data. If no match exists for its semester, the card keeps its spreadsheet data and shows **spreadsheet**.
+- Select **Sync MyPortal** to search every published term for every spreadsheet course. Course details show published sections in other terms too. If the assigned semester has not been published yet, the card keeps its spreadsheet data and shows **spreadsheet**.
 - In **Course catalog**, select **Schedule** or **Reschedule** beside a course to choose its semester without returning to the timeline.
 - Select **×** on a semester to remove it. Any courses in that semester move to **Unscheduled**. You can select **Undo** to restore the semester and its courses.
+
+Use **Schedule** to view the active semester as recurring calendar events. The calendar includes daily, monthly, and semester views. Events use MyPortal meeting days, times, and class start/end dates when available.
 
 When you move a course, Schedule recommends an open section that does not overlap the selected sections already in that semester. If every published section overlaps, the move is blocked. You can choose a different section from the course details. Meeting patterns use `R` for Thursday; online session labels distinguish `OL1` and `OL2` when MyPortal provides them.
 
