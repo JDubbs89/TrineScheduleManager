@@ -633,7 +633,14 @@
     portalSyncBusy = true; render();
     if (!silent) toast('Matching spreadsheet courses to MyPortal…');
     try {
-      const data = await requestEnrichment(S.courses.map((c) => coursePayload(c)));
+      const scheduled = S.courses.filter((c) => c.term && c.term !== 'TR');
+      const remaining = S.courses.filter((c) => !c.term || c.term === 'TR');
+      let data = { errors: [] };
+      if (scheduled.length) data = await requestEnrichment(scheduled.map((c) => coursePayload(c)));
+      if (remaining.length) {
+        const rest = await requestEnrichment(remaining.map((c) => coursePayload(c)));
+        data = { errors: [...(data.errors || []), ...(rest.errors || [])] };
+      }
       const preferred = new Map(S.courses.map((c) => [c.id, sectionKey(c.section)]));
       for (const c of S.courses) if (c.term && c.portal?.byTerm?.[c.term]) c.section = null;
       for (const c of [...S.courses].filter((x) => x.term).sort((a, b) => E.tkey(a.term) - E.tkey(b.term) || cmpCode(a, b))) {

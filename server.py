@@ -13,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -351,6 +352,7 @@ class PortalClient:
     def __init__(self, cookie: str = "") -> None:
         self.cookie = cookie.strip()
         self.opener = build_opener(SafeRedirectHandler(), HTTPCookieProcessor(CookieJar()))
+        self.public_search_client = PortalClient("") if self.cookie else self
         # A Web Forms viewstate belongs to the cookie session that fetched it.
         self.lock = threading.RLock()
 
@@ -364,6 +366,8 @@ class PortalClient:
         try:
             with self.opener.open(request, timeout=25) as response:
                 return response.read().decode(response.headers.get_content_charset() or "utf-8", "replace")
+        except (TimeoutError, socket.timeout) as error:
+            raise RuntimeError("MyPortal query timed out without a response") from error
         except HTTPError as error:
             raise RuntimeError(f"MyPortal returned HTTP {error.code}") from error
         except URLError as error:
@@ -379,7 +383,7 @@ class PortalClient:
 
     def options(self) -> dict[str, object]:
         with self.lock:
-            form = self.form()
+            form = self.public_search_client.form()
         names = {
             "terms": "pg0$V$ddlTerm",
             "departments": "pg0$V$ddlDept",
@@ -395,7 +399,7 @@ class PortalClient:
 
     def search(self, query: dict[str, object]) -> dict[str, object]:
         with self.lock:
-            return self._search(query)
+            return self.public_search_client._search(query)
 
     def availability(self, query: dict[str, object]) -> dict[str, object]:
         code = clean(query.get("courseCode"), 30).upper()
@@ -408,7 +412,8 @@ class PortalClient:
             raise ValueError("Invalid starting term")
 
         with self.lock:
-            form = self.form()
+            search_client = self.public_search_client
+            form = search_client.form()
             published = []
             for option in form.selects["pg0$V$ddlTerm"].options:
                 plan_term = portal_term_to_plan_term(option["value"], option["label"])
@@ -418,7 +423,7 @@ class PortalClient:
 
             terms = []
             for option, plan_term in published:
-                response = self._search({
+                response = search_client._search({
                     "term": option["value"], "department": department,
                     "courseNumber": number, "division": "UG", "campus": "",
                     "status": "OpenFull",
@@ -442,7 +447,8 @@ class PortalClient:
             raise ValueError("Invalid starting term")
 
         with self.lock:
-            form = self.form()
+            search_client = self.public_search_client
+            form = search_client.form()
             published: dict[str, dict[str, str]] = {}
             for option in form.selects["pg0$V$ddlTerm"].options:
                 plan_term = portal_term_to_plan_term(option["value"], option["label"])
@@ -451,7 +457,8 @@ class PortalClient:
 
             enriched: dict[str, object] = {}
             errors = []
-            cache: dict[tuple[str, str], list[dict[str, object]]] = {}
+            records = []
+            batch_bounds: dict[str, tuple[int, int]] = {}
             for raw in courses:
                 if not isinstance(raw, dict):
                     continue
@@ -465,6 +472,15 @@ class PortalClient:
                 departments = list(dict.fromkeys(value.split()[0] for value in valid_codes))
                 if not departments and re.match(r"^[A-Z]{2,9}$", code):
                     departments = [code]
+                records.append((course_id, code, title, term, valid_codes, departments))
+                for value in valid_codes:
+                    department, number = value.split()
+                    low, high = batch_bounds.get(department, (int(number), int(number)))
+                    batch_bounds[department] = (min(low, int(number)), max(high, int(number)))
+        batch_cache: dict[tuple[str, str], list[dict[str, object]]] = {}
+        number_cache: dict[tuple[str, str, str], list[dict[str, object]]] = {}
+        batch_failures: set[tuple[str, str]] = set()
+        for course_id, code, title, term, valid_codes, departments in records:
                 # Sweep every published term for every spreadsheet course. This
                 # preserves currently published offerings even when the planner
                 # assigns the course to a later, not-yet-published semester.
@@ -482,27 +498,43 @@ class PortalClient:
                     search_error = ""
                     try:
                         for candidate in valid_codes:
-                            key = (portal_term["value"], candidate)
-                            if key not in cache:
-                                dept, number = candidate.split()
-                                cache[key] = self._search({
-                                    "term": portal_term["value"], "department": dept,
-                                    "courseNumber": number, "division": "UG", "campus": "",
-                                    "status": "OpenFull",
-                                })["results"]
-                            sections = cache[key]
+                            dept, number = candidate.split()
+                            key = (portal_term["value"], dept)
+                            bounds = batch_bounds.get(dept, (int(number), int(number)))
+                            if key not in batch_cache and key not in batch_failures:
+                                try:
+                                    batch_cache[key] = search_client._search({
+                                        "term": portal_term["value"], "department": dept,
+                                        "courseFrom": str(bounds[0]), "courseTo": str(bounds[1]),
+                                        "division": "UG", "campus": "", "status": "OpenFull",
+                                    })["results"]
+                                except ValueError as error:
+                                    if str(error) != "Invalid course number range":
+                                        raise
+                                    batch_failures.add(key)
+                            if key in batch_failures:
+                                number_key = (portal_term["value"], dept, number)
+                                if number_key not in number_cache:
+                                    number_cache[number_key] = search_client._search({
+                                        "term": portal_term["value"], "department": dept,
+                                        "courseNumber": number, "division": "UG", "campus": "",
+                                        "status": "OpenFull",
+                                    })["results"]
+                                candidates = number_cache[number_key]
+                            else:
+                                candidates = batch_cache[key]
+                            sections = [
+                                result for result in candidates
+                                if re.match(rf"^{re.escape(dept)}\s+{re.escape(number)}(?:\s|$)", result.get("courseCode", ""))
+                            ]
                             if sections:
                                 matched_by = "code"
                                 break
                         if not sections and title and departments:
-                            key = (portal_term["value"], f"{departments[0]}:{title}")
-                            if key not in cache:
-                                cache[key] = self._search({
-                                    "term": portal_term["value"], "department": departments[0],
-                                    "title": title, "division": "UG", "campus": "",
-                                    "status": "OpenFull",
-                                })["results"]
-                            sections = cache[key]
+                            sections = [
+                                result for result in batch_cache.get((portal_term["value"], departments[0]), [])
+                                if result.get("title", "").casefold() == title.casefold()
+                            ]
                             if sections:
                                 matched_by = "title"
                     except RuntimeError as error:
@@ -563,8 +595,21 @@ class PortalClient:
         replace("pg0$V$ddlSecStatus", clean(query.get("status"), 12) or "OpenFull")
 
         number = clean(query.get("courseNumber"), 12)
-        numbers = {o["value"] for o in form.selects["pg0$V$ddlCourseFrom"].options}
-        if number and number in numbers:
+        course_from = clean(query.get("courseFrom"), 12)
+        course_to = clean(query.get("courseTo"), 12)
+        course_from_field = form.selects.get("pg0$V$ddlCourseFrom")
+        course_to_field = form.selects.get("pg0$V$ddlCourseTo")
+        numbers = {o["value"] for o in course_from_field.options} if course_from_field else set()
+        if course_from or course_to:
+            if not course_from_field or not course_to_field:
+                course_from = course_to = ""
+            elif (not course_from or not course_to or course_from not in numbers
+                    or course_to not in {o["value"] for o in course_to_field.options}):
+                raise ValueError("Invalid course number range")
+            else:
+                replace("pg0$V$ddlCourseFrom", course_from)
+                replace("pg0$V$ddlCourseTo", course_to)
+        elif number and number in numbers and course_to_field:
             replace("pg0$V$ddlCourseFrom", number)
             replace("pg0$V$ddlCourseTo", number)
         elif number:
