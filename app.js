@@ -625,6 +625,7 @@
     if (f === 'live-search') searchMyPortal(e.target);
     if (f === 'account') authenticateAccount('login');
     if (f === 'password') changeAccountPassword();
+    if (f === 'portal-cookies') uploadPortalCookies(e.target);
   });
   const dlgShell = (title, body, foot) => `<div class="dlg-h"><h2>${title}</h2><button class="btn sm" data-act="close">Close</button></div><div class="dlg-b">${body}</div>${foot ? `<div class="dlg-f">${foot}</div>` : ''}`;
 
@@ -645,9 +646,71 @@
     const conflict = account.conflict ? `<div class="callout err"><b>Sync conflict</b><br>The server was updated by another client${account.conflict.updatedAt ? ` at ${esc(new Date(account.conflict.updatedAt).toLocaleString())}` : ''}. Reload its copy or overwrite it with this browser’s current plan.</div>` : '';
     const status = account.syncing ? 'Syncing…' : account.updatedAt ? `Last synced ${new Date(account.updatedAt).toLocaleString()}` : 'This account does not have a saved schedule yet';
     const passwordWarning = account.user.mustChangePassword ? '<div class="callout warn"><b>Change the default password</b><br>This account still uses the public default password, password123.</div>' : '';
-    const body = `${passwordWarning}${conflict}<div class="account-summary"><span class="account-avatar" aria-hidden="true">${esc(account.user.username.slice(0, 1).toUpperCase())}</span><div><b>${esc(account.user.username)}</b><span>${esc(status)}</span></div></div><p class="muted">Changes are saved locally first, then synchronized to this account. You can sign into the same account from another browser or device that can reach this server.</p>`;
+    const body = `${passwordWarning}${conflict}<div class="account-summary"><span class="account-avatar" aria-hidden="true">${esc(account.user.username.slice(0, 1).toUpperCase())}</span><div><b>${esc(account.user.username)}</b><span>${esc(status)}</span></div></div><p class="muted">Changes are saved locally first, then synchronized to this account. You can sign into the same account from another browser or device that can reach this server.</p>
+      <div class="portal-cookie-manager"><h3>MyPortal session</h3><p data-portal-session-status role="status">Current Session Status: <span data-portal-session-value>Checking…</span></p><p class="muted" data-portal-cookie-status role="status">Checking session settings…</p>
+      <form class="form" data-form="portal-cookies" hidden><label class="fld full"><span>Cookie JSON file</span><input name="cookies" type="file" accept=".json,application/json" required aria-describedby="portal-cookie-help"></label><p id="portal-cookie-help" class="muted fld full">Sign in to MyPortal, then export its cookies as JSON. Uploading verifies your login and replaces the saved session on this server.</p><div class="fld full"><button class="btn primary" type="submit">Upload and update session</button></div></form></div>`;
     const conflictActions = account.conflict ? '<button class="btn" data-act="account-reload">Use server copy</button><button class="btn danger" data-act="account-overwrite">Use this browser copy</button>' : '<button class="btn primary" data-act="account-sync">Sync now</button>';
     return { body, foot: `<button class="btn grow" data-act="account-logout">Sign out</button><button class="btn" data-act="account-password">Change password</button>${conflictActions}` };
+  }
+
+  function renderPortalSessionStatus(manager, data) {
+    const line = $('[data-portal-session-status]', manager);
+    const value = $('[data-portal-session-value]', manager);
+    line.hidden = data.canManage === false;
+    value.textContent = data.valid ? (data.displayName || 'Session Valid') : 'Session Invalid';
+    value.className = data.valid ? 'portal-session-valid' : 'portal-session-invalid';
+  }
+
+  async function loadPortalCookieStatus() {
+    const status = $('[data-portal-cookie-status]', dlg);
+    if (!status || !account.authenticated) return;
+    const userId = account.user.id;
+    try {
+      const response = await fetch('/api/myportal-cookies', { headers: { Accept: 'application/json' } });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not load MyPortal session settings');
+      if (!status.isConnected || account.user?.id !== userId) return;
+      renderPortalSessionStatus(status.parentElement, data);
+      status.textContent = data.canManage ? (data.configured ? 'A saved session is configured. Upload fresh cookies when it expires.' : 'No usable session is configured. Upload cookies to connect MyPortal.') : 'This server’s MyPortal session is managed by its owner account.';
+      $('form[data-form="portal-cookies"]', status.parentElement).hidden = !data.canManage;
+    } catch (error) {
+      if (status.isConnected) {
+        status.textContent = error.message;
+        const value = $('[data-portal-session-value]', status.parentElement);
+        value.textContent = 'Unable to check';
+        value.className = '';
+      }
+    }
+  }
+
+  async function uploadPortalCookies(form) {
+    const file = form.elements.cookies.files[0];
+    if (!file || !account.authenticated) return;
+    const status = $('[data-portal-cookie-status]', form.parentElement);
+    const button = $('button[type="submit"]', form);
+    button.disabled = true;
+    form.setAttribute('aria-busy', 'true');
+    status.textContent = 'Verifying your MyPortal login and saving the session…';
+    try {
+      if (file.size > 1_000_000) throw new Error('Choose a cookie JSON file smaller than 1 MB');
+      let cookies;
+      try { cookies = JSON.parse(await file.text()); }
+      catch (error) { throw new Error('This file is not valid JSON. Choose a browser cookie export.'); }
+      const response = await fetch('/api/myportal-cookies', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ cookies }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not update the MyPortal session');
+      form.reset();
+      renderPortalSessionStatus(form.parentElement, data);
+      status.textContent = 'MyPortal login verified and session updated. You can now import your transcript.';
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      button.disabled = false;
+      form.removeAttribute('aria-busy');
+    }
   }
 
   function openPasswordChange() {
@@ -1113,11 +1176,12 @@
       profile,
       data: { body: dataPanel(), foot: '' },
     };
-    const labels = { general: 'General', profile: 'Profile', data: 'Data & backup' };
+    const labels = { general: 'General', profile: 'Account', data: 'Data & backup' };
     const tabs = Object.keys(panels).map((id) => `<button type="button" class="settings-tab" role="tab" id="settings-tab-${id}" aria-controls="settings-panel-${id}" aria-selected="${id === tab}" tabindex="${id === tab ? 0 : -1}" data-act="settings-tab" data-tab="${id}">${labels[id]}</button>`).join('');
     const content = Object.entries(panels).map(([id, panel]) => `<section id="settings-panel-${id}" role="tabpanel" aria-labelledby="settings-tab-${id}" tabindex="0" ${id === tab ? '' : 'hidden'}>${panel.body}${panel.foot ? `<div class="settings-actions">${panel.foot}</div>` : ''}</section>`).join('');
     openDlg(dlgShell('Settings', `<div class="settings-tabs" role="tablist" aria-orientation="vertical" aria-label="Settings sections">${tabs}</div>${content}`));
     dlg.classList.add('settings-dialog');
+    loadPortalCookieStatus();
   }
   function selectSettingsTab(tab, focus = false) {
     $$('[data-act="settings-tab"]', dlg).forEach((button) => {

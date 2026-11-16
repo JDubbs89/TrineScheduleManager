@@ -17,6 +17,7 @@ import secrets
 import socket
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 
@@ -66,6 +67,7 @@ class ScheduleConflictError(RuntimeError):
 USER_AGENT = "ScheduleManager/1.0 (+local course search)"
 MAX_REQUEST_BYTES = 2_000_000
 SESSION_COOKIE = "schedmgr_session"
+COOKIE_STORE_LOCK = threading.RLock()
 
 
 def load_env(path: Path) -> None:
@@ -104,7 +106,9 @@ def cookie_header_from_json(raw: str) -> str:
     for item in exported:
         if not isinstance(item, dict):
             continue
-        name, value = str(item.get("name", "")), str(item.get("value", ""))
+        name, value = item.get("name", ""), item.get("value", "")
+        if not isinstance(name, str) or not isinstance(value, str):
+            continue
         domain = str(item.get("domain", "")).lstrip(".").lower()
         path = str(item.get("path", "/"))
         expiry = item.get("expirationDate", item.get("expires"))
@@ -117,9 +121,9 @@ def cookie_header_from_json(raw: str) -> str:
                 continue
         except (TypeError, ValueError):
             pass
-        if not name or any(char in name for char in ";=\r\n"):
+        if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
             continue
-        if any(char in value for char in ";\r\n"):
+        if any(ord(char) < 33 or ord(char) > 126 or char in ';"\\,' for char in value):
             continue
         cookies[name] = value
     if not cookies:
@@ -150,7 +154,83 @@ def configured_cookie(root: Path = ROOT) -> tuple[str, str]:
     return "", "public search"
 
 
+def save_portal_cookie(cookie: str, root: Path = ROOT) -> None:
+    """Atomically persist an upload and activate it without restarting the server."""
+    # Store only the filtered portal cookies, not unrelated browser credentials.
+    normalized = dict(part.split("=", 1) for part in cookie.split("; "))
+    inline = json.dumps(normalized, ensure_ascii=True, separators=(",", ":")).replace("'", "\\u0027")
+    updates = {"MYPORTAL_SESSION_COOKIE": "", "MYPORTAL_COOKIES_JSON": inline,
+               "MYPORTAL_COOKIES_JSON_FILE": ""}
+    with COOKIE_STORE_LOCK:
+        path = root / ".env"
+        lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+        lines = [line for line in lines if line.partition("=")[0].strip() not in updates]
+        lines.extend(f"{key}='{value}'" for key, value in updates.items())
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=root,
+                                             prefix=".env-", delete=False) as output:
+                temporary = Path(output.name)
+                output.write("\n".join(lines) + "\n")
+                output.flush()
+                os.fsync(output.fileno())
+            temporary.replace(path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        os.environ.update(updates)
+
+
 TRANSCRIPT_URL = "https://myportal.trine.edu/ICS/Student/Transcripts_and_Grade_Reports.jnz?portlet=Unofficial_Transcript"
+
+
+class PortalIdentityParser(HTMLParser):
+    """Read the signed-in user's display name from MyPortal's welcome bar."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.depth = 0
+        self.welcome_depth = None
+        self.name_depth = None
+        self.welcome_text = []
+        self.name_text = []
+        self.logged_out = False
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        element_id = attributes.get("id", "").lower()
+        if "welcomebackbarloggedout" in element_id:
+            self.logged_out = True
+        if tag in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}:
+            return
+        self.depth += 1
+        if element_id == "welcomebackbar":
+            self.welcome_depth = self.depth
+        if "welcomebackbarloggedin" in element_id and element_id.endswith(("name", "username")):
+            self.name_depth = self.depth
+
+    def handle_endtag(self, tag):
+        if self.depth == self.name_depth:
+            self.name_depth = None
+        if self.depth == self.welcome_depth:
+            self.welcome_depth = None
+        self.depth = max(0, self.depth - 1)
+
+    def handle_data(self, data):
+        if self.welcome_depth is not None:
+            self.welcome_text.append(data)
+        if self.name_depth is not None:
+            self.name_text.append(data)
+
+    def display_name(self) -> str:
+        if self.logged_out:
+            return ""
+        name = " ".join(" ".join(self.name_text).split())
+        if not name:
+            welcome = " ".join(" ".join(self.welcome_text).split())
+            match = re.search(r"Welcome\s+back\s*[,!:]?\s+(.+?)(?:\s*[!|]|\s+Log\s*out\b|$)", welcome, re.I)
+            name = match[1].strip() if match else ""
+        return name[:200]
 
 
 class TranscriptParser(HTMLParser):
@@ -973,6 +1053,16 @@ class CourseCache:
 class PortalClient:
     RESULT_LIMIT = 20
 
+    def session_status(self) -> dict:
+        if not self.cookie:
+            return {"valid": False, "displayName": ""}
+        page = self._request(TRANSCRIPT_URL)
+        parser = PortalIdentityParser()
+        parser.feed(page)
+        name = parser.display_name()
+        valid = not parser.logged_out and bool(name or 'id="pg0_V_tblDivisonData"' in page or "pg0_V_lnkViewTrans" in page)
+        return {"valid": valid, "displayName": name if valid else ""}
+
     def transcript(self) -> dict:
         if not self.cookie:
             raise ValueError("Export your signed-in MyPortal cookies to myportal-cookies.json first")
@@ -1517,6 +1607,20 @@ class Handler(SimpleHTTPRequestHandler):
         return super().send_head()
 
     def do_GET(self) -> None:
+        if self.path == "/api/myportal-cookies":
+            user = self.require_user()
+            if not user:
+                return
+            if not self.is_portal_owner(user):
+                self.json_response({"canManage": False})
+                return
+            try:
+                cookie, _source = configured_cookie()
+                status = PortalClient(cookie).session_status()
+                self.json_response({"canManage": True, "configured": bool(cookie), **status})
+            except Exception:
+                self.json_response({"canManage": True, "valid": False, "displayName": ""})
+            return
         if self.path == "/api/session":
             user = self.current_user()
             self.json_response({"authenticated": bool(user), "user": user})
@@ -1560,13 +1664,42 @@ class Handler(SimpleHTTPRequestHandler):
             self.json_response({"error": "Configured schedule data could not be loaded"}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def do_POST(self) -> None:
+        if self.path == "/api/myportal-cookies":
+            user = self.require_user()
+            if not user:
+                return
+            if not self.is_portal_owner(user):
+                self.json_response({"error": "Only the MyPortal cookie store owner can update this session"}, HTTPStatus.FORBIDDEN)
+                return
+            if self.headers.get_content_type() != "application/json":
+                self.json_response({"error": "Upload cookies as JSON"}, HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                payload = self.read_json()
+                cookie = cookie_header_from_json(json.dumps(payload.get("cookies")))
+                if not dict(part.split("=", 1) for part in cookie.split("; ")).get(".ASPXAUTH"):
+                    raise ValueError("The export must include a current .ASPXAUTH login cookie for MyPortal")
+                # Verify the new login before replacing the working credentials.
+                portal = PortalClient(cookie)
+                portal.transcript()
+                status = portal.session_status()
+                if not status["valid"]:
+                    raise RuntimeError("MyPortal session is invalid")
+                save_portal_cookie(cookie)
+                self.json_response({"configured": True, "verified": True, **status})
+            except ValueError as error:
+                self.json_response({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except OSError:
+                self.json_response({"error": "Could not save the MyPortal session to .env"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            except Exception:
+                self.json_response({"error": "Could not verify the MyPortal session. Sign in to MyPortal and export fresh cookies, then try again."}, HTTPStatus.BAD_GATEWAY)
+            return
         if self.path == "/api/transcript":
             user = self.require_user()
             if not user:
                 return
             # This cookie export belongs to one student, not every app account.
-            owner = os.environ.get("MYPORTAL_OWNER_USERNAME", "jonathan")
-            if str(user["username"]).casefold() != owner.casefold():
+            if not self.is_portal_owner(user):
                 self.json_response({"error": "The server's MyPortal cookie store belongs to another account"}, HTTPStatus.FORBIDDEN)
                 return
             def fetch_transcript():
@@ -1680,6 +1813,10 @@ class Handler(SimpleHTTPRequestHandler):
         if not user:
             self.json_response({"error": "Sign in to access this schedule"}, HTTPStatus.UNAUTHORIZED)
         return user
+
+    @staticmethod
+    def is_portal_owner(user: dict[str, object]) -> bool:
+        return str(user["username"]).casefold() == os.environ.get("MYPORTAL_OWNER_USERNAME", "jonathan").casefold()
 
     @staticmethod
     def session_cookie(token: str) -> str:

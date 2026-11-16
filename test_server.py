@@ -14,6 +14,7 @@ from urllib.error import URLError
 from server import (
     AuthenticationError, CourseCache, PortalClient, ScheduleConflictError,
     Handler, SearchFormParser, TranscriptParser, UserStore, classify_section,
+    configured_cookie, cookie_header_from_json, load_env, save_portal_cookie,
 )
 
 
@@ -101,6 +102,120 @@ class TranscriptTests(unittest.TestCase):
                 response = connection.getresponse()
                 self.assertEqual(response.status, 404)
                 response.read()
+            finally:
+                connection.close()
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join()
+                store.connection.close()
+
+
+class CookieManagerTests(unittest.TestCase):
+    def test_session_status_reads_portal_name_and_rejects_login_page(self):
+        client = PortalClient('.ASPXAUTH=test')
+        pages = [
+            '<div id="welcomeBackBar"><span>Welcome back, <b>Jane Doe</b>!</span><a>Logout</a></div>',
+            '<div id="welcomeBackBar"><span id="siteNavBar_welcomeBackBarLoggedIn_lblUserName">Jane &amp; Doe</span></div>',
+            '<div id="welcomeBackBar"><div id="siteNavBar_welcomeBackBarLoggedOut_welcomeBackBarLoggedOut">Log in</div></div>',
+        ]
+        with patch.object(client, '_request', side_effect=pages):
+            self.assertEqual(client.session_status(), {'valid': True, 'displayName': 'Jane Doe'})
+            self.assertEqual(client.session_status(), {'valid': True, 'displayName': 'Jane & Doe'})
+            self.assertEqual(client.session_status(), {'valid': False, 'displayName': ''})
+        self.assertEqual(PortalClient('').session_status(), {'valid': False, 'displayName': ''})
+
+    def test_persists_only_portal_cookies_and_reloads_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ):
+            root = Path(directory)
+            env = root / '.env'
+            env.write_text('# Keep settings\nOTHER_SETTING=keep\nMYPORTAL_SESSION_COOKIE=old\nMYPORTAL_SESSION_COOKIE=duplicate\nMYPORTAL_COOKIES_JSON_FILE=old.json\n')
+            exported = [
+                {'name': '.ASPXAUTH', 'value': "new'login", 'domain': 'myportal.trine.edu'},
+                {'name': 'foreign', 'value': 'private', 'domain': 'example.com'},
+                {'name': 'expired', 'value': 'old', 'expirationDate': 1},
+            ]
+            cookie = cookie_header_from_json(json.dumps(exported))
+            save_portal_cookie(cookie, root)
+            self.assertEqual(configured_cookie(root)[0], ".ASPXAUTH=new'login")
+            contents = env.read_text()
+            self.assertIn('# Keep settings\nOTHER_SETTING=keep\n', contents)
+            self.assertNotIn('foreign', contents)
+            self.assertNotIn('expired', contents)
+            self.assertEqual(contents.count('MYPORTAL_SESSION_COOKIE='), 1)
+            self.assertEqual(env.stat().st_mode & 0o777, 0o600)
+            for key in ['MYPORTAL_SESSION_COOKIE', 'MYPORTAL_COOKIES_JSON', 'MYPORTAL_COOKIES_JSON_FILE']:
+                os.environ.pop(key, None)
+            load_env(env)
+            self.assertEqual(configured_cookie(root)[0], cookie)
+
+    def test_failed_write_keeps_existing_file_and_active_session(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'MYPORTAL_SESSION_COOKIE': 'old=login'}):
+            root = Path(directory)
+            env = root / '.env'
+            env.write_text('OTHER_SETTING=keep\n')
+            with patch.object(Path, 'replace', side_effect=OSError('disk full')):
+                with self.assertRaises(OSError):
+                    save_portal_cookie('.ASPXAUTH=new', root)
+            self.assertEqual(env.read_text(), 'OTHER_SETTING=keep\n')
+            self.assertEqual(configured_cookie(root)[0], 'old=login')
+            self.assertEqual(list(root.iterdir()), [env])
+
+    def test_upload_access_validation_and_immediate_transcript_use(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'MYPORTAL_OWNER_USERNAME': 'portal-owner', 'MYPORTAL_SESSION_COOKIE': 'old=login'}):
+            root = Path(directory)
+            store = UserStore(root / 'users.sqlite3', bcrypt_rounds=4)
+            _, owner_token = store.register('portal-owner', 'long enough password')
+            _, other_token = store.register('other-student', 'long enough password')
+
+            class TestHandler(Handler):
+                user_store = store
+
+                def log_message(self, *args):
+                    pass
+
+            httpd = ThreadingHTTPServer(('127.0.0.1', 0), TestHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            connection = HTTPConnection(*httpd.server_address)
+
+            def request(method, token, payload=None, content_type='application/json', path='/api/myportal-cookies'):
+                connection.request(method, path, body=json.dumps(payload) if payload is not None else None,
+                                   headers={'Cookie': f'schedmgr_session={token}', 'Content-Type': content_type})
+                response = connection.getresponse()
+                return response.status, json.loads(response.read())
+
+            try:
+                payload = {'cookies': [{'name': '.ASPXAUTH', 'value': 'new-login', 'domain': 'myportal.trine.edu'}]}
+                with patch('server.save_portal_cookie', side_effect=lambda cookie: save_portal_cookie(cookie, root)) as save, \
+                     patch.object(PortalClient, 'session_status', return_value={'valid': True, 'displayName': 'Jane Doe'}) as session_status, \
+                     patch.object(PortalClient, 'transcript', autospec=True, return_value={'gpa': 3.5}) as verify:
+                    for token, expected in [('', 401), (other_token, 403)]:
+                        self.assertEqual(request('POST', token, payload)[0], expected)
+                    self.assertEqual(request('GET', other_token)[1], {'canManage': False})
+                    session_status.assert_not_called()
+                    self.assertEqual(request('GET', owner_token)[1], {'canManage': True, 'configured': True, 'valid': True, 'displayName': 'Jane Doe'})
+                    session_status.side_effect = RuntimeError('upstream failure')
+                    self.assertEqual(request('GET', owner_token)[1], {'canManage': True, 'valid': False, 'displayName': ''})
+                    session_status.side_effect = None
+                    for invalid in [None, [], {'foo': None}, [{'name': '.ASPXAUTH', 'value': 'old', 'expirationDate': 1}],
+                                    [{'name': '.ASPXAUTH', 'value': 'bad\nheader'}],
+                                    [{'name': '.ASPXAUTH', 'value': 'foreign', 'domain': 'example.com'}]]:
+                        self.assertEqual(request('POST', owner_token, {'cookies': invalid})[0], 400)
+                    self.assertEqual(request('POST', owner_token, payload, 'text/plain')[0], 400)
+                    verify.assert_not_called()
+                    save.assert_not_called()
+                    verify.side_effect = RuntimeError('expired login')
+                    self.assertEqual(request('POST', owner_token, payload)[0], 502)
+                    save.assert_not_called()
+                    self.assertEqual(configured_cookie(root)[0], 'old=login')
+                    verify.side_effect = None
+                    status, result = request('POST', owner_token, payload)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(result, {'configured': True, 'verified': True, 'valid': True, 'displayName': 'Jane Doe'})
+                    self.assertNotIn('new-login', json.dumps(result))
+                    self.assertEqual(configured_cookie(root)[0], '.ASPXAUTH=new-login')
+                    self.assertEqual(request('POST', owner_token, path='/api/transcript')[0], 200)
+                    self.assertEqual(verify.call_args.args[0].cookie, '.ASPXAUTH=new-login')
             finally:
                 connection.close()
                 httpd.shutdown()
