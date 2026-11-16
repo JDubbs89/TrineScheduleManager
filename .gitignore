@@ -1,8 +1,15 @@
 .env
+/.json
 myportal-cookies.json
+myportal-*cookies*.json
 cookies.json
 *_cookies.json
 __pycache__/
 *.pyc
+schedule-cache.sqlite3
+schedule-cache.sqlite3-*
+schedule-users.sqlite3
+schedule-users.sqlite3-*
+venv/**
 data.js
 *.xlsx

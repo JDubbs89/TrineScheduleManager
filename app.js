@@ -3,6 +3,7 @@
   'use strict';
   const E = window.Engine;
   const KEY = 'schedmgr.v1';
+  const SKIP_DEFAULT_LOGIN_KEY = 'schedmgr.skipDefaultLogin';
   const $ = (s, el = document) => el.querySelector(s);
   const $$ = (s, el = document) => [...el.querySelectorAll(s)];
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
@@ -10,6 +11,9 @@
   const OFF_NAME = { ALL: 'Any term', FA: 'Fall', SP: 'Spring', SU: 'Summer' };
 
   let S, LIVE = null, undoStack = [], dragId = null, firstRender = true, scenarios = null, portalSyncBusy = false;
+  let remoteSaveTimer = null, lastRemoteJson = '', hadLocalState = false;
+  const account = { authenticated: false, user: null, revision: 0, updatedAt: null, syncing: false, conflict: null };
+  const courseRefreshBusy = new Set();
 
   /* ================= state ================= */
   function fixCourse(c) {
@@ -52,27 +56,131 @@
         if (o.ui.tab === 'planner' || o.ui.tab === 'schedule') o.ui.tab = 'timeline';
         return o;
       }
-      async function loadExternalSeed() {
-        if (!/^https?:$/.test(location.protocol)) return null;
-        try {
-          const response = await fetch('/api/seed-data', { headers: { Accept: 'application/json' } });
-          if (!response.ok) return null;
-          const data = await response.json();
-          return data.available && data.seed ? externalState(data.seed) : null;
-        } catch (error) {
-          return null;
-        }
-      }
     } catch (e) { /* storage blocked or corrupt: fall through to seed */ }
     return blankState();
   }
-  function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* private mode: state lives in memory only */ } }
+  async function loadExternalSeed() {
+    if (!/^https?:$/.test(location.protocol)) return null;
+    try {
+      const response = await fetch('/api/seed-data', { headers: { Accept: 'application/json' } });
+      if (!response.ok) return null;
+      const data = await response.json();
+      return data.available && data.seed ? externalState(data.seed) : null;
+    } catch (error) {
+      return null;
+    }
+  }
+  const remoteState = () => ({ v: S.v, meta: S.meta, minor: S.minor, courses: S.courses, terms: S.terms, settings: S.settings });
+  function saveLocal() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* private mode: state lives in memory only */ } }
+  function save() { saveLocal(); queueRemoteSave(); }
+  function queueRemoteSave() {
+    if (!account.authenticated || !/^https?:$/.test(location.protocol)) return;
+    const serialized = JSON.stringify(remoteState());
+    if (serialized === lastRemoteJson) return;
+    clearTimeout(remoteSaveTimer);
+    remoteSaveTimer = setTimeout(() => pushRemoteSchedule(), 500);
+  }
+  function renderAccountIndicator() {
+    $$('[data-act="settings"]').forEach((button) => {
+      button.title = account.authenticated ? `Settings · ${account.user.username}` : 'Settings';
+    });
+  }
+  function setSignedOut() {
+    Object.assign(account, { authenticated: false, user: null, revision: 0, updatedAt: null, syncing: false, conflict: null });
+    lastRemoteJson = '';
+    clearTimeout(remoteSaveTimer);
+    renderAccountIndicator();
+  }
+  function applyRemoteState(state) {
+    if (!state || !Array.isArray(state.courses) || !Array.isArray(state.terms)) throw new Error('The server schedule is invalid');
+    const ui = S.ui || defaultUI();
+    S = {
+      v: Number(state.v) || 1,
+      meta: state.meta || { student: account.user?.username || 'User', program: 'Custom schedule', source: 'account' },
+      minor: state.minor || null,
+      courses: state.courses.map(fixCourse), terms: state.terms.map((term) => term.id || term),
+      settings: { ...E.DEFAULTS, ...state.settings }, ui,
+    };
+    normalizeTerms(); saveLocal(); render();
+  }
+  async function pushRemoteSchedule(force = false, announce = false) {
+    if (!account.authenticated || account.syncing) return false;
+    clearTimeout(remoteSaveTimer);
+    const state = remoteState(), serialized = JSON.stringify(state);
+    if (!force && serialized === lastRemoteJson) return true;
+    account.syncing = true; renderAccountIndicator();
+    try {
+      const response = await fetch('/api/schedule', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ state, revision: account.revision, force }),
+      });
+      const data = await response.json();
+      if (response.status === 401) { setSignedOut(); throw new Error('Your session expired. Sign in again'); }
+      if (response.status === 409) {
+        account.conflict = { revision: data.revision, updatedAt: data.updatedAt };
+        throw new Error('This schedule changed on another client. Open Settings → Profile to choose which copy to keep');
+      }
+      if (!response.ok) throw new Error(data.error || `Sync failed (${response.status})`);
+      Object.assign(account, { revision: data.revision, updatedAt: data.updatedAt, conflict: null });
+      lastRemoteJson = serialized;
+      if (announce) toast('Schedule synced');
+      return true;
+    } catch (error) {
+      toast(error.message);
+      return false;
+    } finally {
+      account.syncing = false; renderAccountIndicator();
+      if (account.authenticated && lastRemoteJson === serialized && JSON.stringify(remoteState()) !== lastRemoteJson) {
+        clearTimeout(remoteSaveTimer);
+        remoteSaveTimer = setTimeout(() => pushRemoteSchedule(), 100);
+      }
+    }
+  }
+  async function loadRemoteSchedule(announce = false) {
+    if (!account.authenticated) return false;
+    try {
+      const response = await fetch('/api/schedule', { headers: { Accept: 'application/json' } });
+      const data = await response.json();
+      if (response.status === 401) { setSignedOut(); throw new Error('Your session expired. Sign in again'); }
+      if (!response.ok) throw new Error(data.error || `Load failed (${response.status})`);
+      Object.assign(account, { revision: data.revision, updatedAt: data.updatedAt, conflict: null });
+      if (data.state) {
+        lastRemoteJson = JSON.stringify(data.state);
+        applyRemoteState(data.state);
+        if (announce) toast('Loaded the server schedule');
+      } else if (hadLocalState || S.courses.length || S.meta?.source !== 'blank plan') {
+        lastRemoteJson = '';
+        return await pushRemoteSchedule(false, announce);
+      }
+      return true;
+    } catch (error) {
+      toast(error.message); return false;
+    }
+  }
+  async function restoreAccount() {
+    if (!/^https?:$/.test(location.protocol)) return;
+    try {
+      let response = await fetch('/api/session', { headers: { Accept: 'application/json' } });
+      let data = await response.json();
+      if ((!response.ok || !data.authenticated) && !localStorage.getItem(SKIP_DEFAULT_LOGIN_KEY)) {
+        response = await fetch('/api/login', {
+          method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify({ username: 'jonathan', password: 'password123' }),
+        });
+        data = await response.json();
+      }
+      if (!response.ok || !data.authenticated) return setSignedOut();
+      Object.assign(account, { authenticated: true, user: data.user });
+      renderAccountIndicator();
+      await loadRemoteSchedule();
+    } catch (error) { setSignedOut(); }
+  }
   function normalizeTerms() {
     const ids = new Set(S.terms.map((t) => t.id || t));
     S.courses.forEach((c) => { if (c.term && c.term !== 'TR') ids.add(c.term); });
     S.terms = [...ids].sort((a, b) => E.tkey(a) - E.tkey(b));
   }
-  const snapshot = () => JSON.stringify({ courses: S.courses, terms: S.terms, settings: S.settings });
+  const snapshot = () => JSON.stringify({ courses: S.courses, terms: S.terms, settings: S.settings, meta: S.meta });
   function mutate(fn) {
     undoStack.push(snapshot()); if (undoStack.length > 80) undoStack.shift();
     fn(); normalizeTerms(); save(); render();
@@ -81,7 +189,7 @@
     const s = undoStack.pop(); if (!s) return toast('Nothing to undo');
     Object.assign(S, JSON.parse(s)); save(); render(); toast('Undone');
   }
-  const ctx = () => E.makeCtx(S.courses, S.settings);
+  const ctx = () => E.makeCtx(S.courses, S.settings, { transcript: S.meta?.transcript });
   const byId = (id) => S.courses.find((c) => c.id === id);
 
   /* ================= helpers ================= */
@@ -92,10 +200,13 @@
   const cmpCode = (a, b) => a.code.localeCompare(b.code, undefined, { numeric: true });
   const sectionKey = (s) => s ? `${s.courseCode}|${s.beginDate}|${s.endDate}` : '';
   const sectionsFor = (c, term) => c.portal?.byTerm?.[term]?.sections || [];
+  const sectionTime = (section) => E.sectionTimeLabel(section);
+  const sectionProfessor = (section) => String(section?.faculty || '').trim() || 'Professor TBA';
   const dateValue = (value) => { const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(value || ''); return m ? new Date(+m[3], +m[1] - 1, +m[2]).getTime() : null; };
   const todayValue = () => { const now = new Date(); return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime(); };
   const sectionNotStarted = (section) => { const start = dateValue(section?.beginDate); return start != null && start > todayValue(); };
-  const currentCourseEditable = (c, cx = ctx()) => c.term !== cx.curId || (c.section ? sectionNotStarted(c.section) : sectionsFor(c, cx.curId).some(sectionNotStarted));
+  // Every semester remains editable, including completed and in-progress terms.
+  const currentCourseEditable = () => true;
   function sectionsOverlap(a, b) {
     if (!a || !b) return false;
     const ab = dateValue(a.beginDate), ae = dateValue(a.endDate), bb = dateValue(b.beginDate), be = dateValue(b.endDate);
@@ -127,17 +238,17 @@
     for (let i = 0; i < S.courses.length; i++) for (let j = i + 1; j < S.courses.length; j++) {
       const a = S.courses[i], b = S.courses[j];
       if (!a.term || a.term !== b.term || !a.section || !b.section || !sectionsOverlap(a.section, b.section)) continue;
-      const msg = `${a.code} ${a.section.daysLabel} ${a.section.timeLabel} overlaps ${b.code} ${b.section.daysLabel} ${b.section.timeLabel}`;
+      const msg = `${a.code} ${a.section.daysLabel} ${sectionTime(a.section)} overlaps ${b.code} ${b.section.daysLabel} ${sectionTime(b.section)}`;
       const issue = { level: 'error', msg, term: a.term, where: tlabel(a.term) };
       all.push(issue); (byCourse[a.id] ||= []).push(issue); (byCourse[b.id] ||= []).push(issue);
     }
     return { all, byCourse };
   }
-  const sectionSummary = (s) => s ? `${s.onlineSession || s.sectionCode || 'Section'} · ${s.daysLabel} · ${s.timeLabel}` : '';
+  const sectionSummary = (s) => s ? `${s.onlineSession || s.sectionCode || 'Section'} · ${s.daysLabel} · ${sectionTime(s)} · ${sectionProfessor(s)}` : '';
   function placementProblems(cx, assign, c, term) {
     const problems = E.placementProblems(cx, assign, c, term);
     const known = sectionsFor(c, term);
-    const upcomingOnly = term === cx.curId && c.term !== term;
+    const upcomingOnly = false;
     if (known.length && !recommendSection(c, term, sectionKey(c.section), upcomingOnly)) problems.push({ msg: upcomingOnly ? 'no not-yet-started section fits your schedule' : 'all published sections overlap your schedule' });
     return problems;
   }
@@ -147,7 +258,7 @@
     if (S.ui.showPast) out.push('TR');
     for (const t of S.terms) {
       const ti = E.tinfo(t), past = ti.key < cx.curKey;
-      if (past && !S.ui.showPast) continue;
+      // Completed semesters remain visible and editable so the plan can be corrected retroactively.
       if (ti.season === 'SU' && !S.ui.showSummers && !has.has(t)) continue;
       out.push(t);
     }
@@ -181,11 +292,27 @@
     const value = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
     return value >= start && value <= end && (section.meetings || []).some((meeting) => meeting.days.some((day) => dayCodes[dayIndex(date)] === day));
   };
-  const eventTime = (course) => {
-    const meeting = course.section?.meetings?.[0];
-    return meeting ? `${meeting.startLabel}–${meeting.endLabel}` : course.section?.timeLabel || 'Time TBA';
+  const eventTime = (course) => sectionTime(course.section);
+  const meetingOnDate = (course, date) => {
+    const section = course.section, day = dayCodes[dayIndex(date)];
+    return (section?.meetings || []).find((meeting) => meeting.days.includes(day)) || null;
   };
-  const eventHtml = (course) => `<button class="calendar-event cat-${esc(course.category)}" data-act="open" data-id="${esc(course.id)}"><b>${esc(course.code)}</b><span>${esc(eventTime(course))}</span></button>`;
+  const formatClock = (minutes) => {
+    const value = Number(minutes);
+    if (!Number.isFinite(value)) return '';
+    const hour = Math.floor(value / 60) % 24, minute = value % 60;
+    if (S.settings.timeFormat === 'military') return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+    const suffix = hour >= 12 ? 'PM' : 'AM', displayHour = hour % 12 || 12;
+    return `${displayHour}:${String(minute).padStart(2, '0')} ${suffix}`;
+  };
+  const meetingLabel = (meeting) => meeting ? `${formatClock(meeting.start)}–${formatClock(meeting.end)}` : '';
+  const eventHtml = (course, meeting = null) => `<button class="calendar-event cat-${esc(course.category)}" data-act="open" data-id="${esc(course.id)}" style="${meeting ? `--event-start:${Math.max(0, (Number(meeting.start) || 0) - DAY_START_MINUTES)};--event-duration:${Math.max(30, (Number(meeting.end) || (Number(meeting.start) + 60)) - (Number(meeting.start) || 0))}` : ''}"><b>${esc(course.code)}</b><span>${esc(meeting ? meetingLabel(meeting) : eventTime(course))}</span></button>`;
+  const DAY_START_MINUTES = 6 * 60;
+  const DAY_END_MINUTES = 24 * 60;
+  const hourLabels = () => Array.from({ length: 19 }, (_, index) => {
+    const hour = 6 + index;
+    return `<span>${esc(formatClock(hour * 60))}</span>`;
+  }).join('');
 
   function viewCalendar(cx) {
     const mode = S.ui.calendarMode || 'month', selected = calendarDate();
@@ -200,7 +327,7 @@
     let body = '';
     if (mode === 'day') {
       const dayEvents = events.filter((course) => eventOnDate(course, selected));
-      body = `<div class="calendar-day"><div class="calendar-day-label">${esc(dateLabel(selected, { weekday: 'long' }))}</div>${dayEvents.length ? dayEvents.map(eventHtml).join('') : '<div class="empty">No scheduled classes on this day.</div>'}</div>`;
+      body = `<div class="calendar-day"><div class="calendar-day-label">${esc(dateLabel(selected, { weekday: 'long' }))}</div><div class="day-schedule"><div class="hour-labels">${hourLabels()}</div><div class="day-grid">${dayEvents.length ? dayEvents.map((course) => eventHtml(course, meetingOnDate(course, selected))).join('') : '<div class="empty">No scheduled classes on this day.</div>'}</div></div></div>`;
     } else if (mode === 'month') {
       const first = new Date(selected.getFullYear(), selected.getMonth(), 1), gridStart = addDays(first, -dayIndex(first));
       body = `<div class="month-grid">${dayLabels.map((label) => `<div class="month-weekday">${label}</div>`).join('')}${Array.from({ length: 42 }, (_, i) => {
@@ -217,7 +344,7 @@
       for (let cursor = addDays(start, -dayIndex(start)); cursor <= end; cursor = addDays(cursor, 7)) weeks.push(cursor);
       body = `<div class="semester-weeks">${weeks.map((week) => {
         const dates = Array.from({ length: 7 }, (_, i) => addDays(week, i)), weekEvents = events.filter((course) => dates.some((date) => eventOnDate(course, date)));
-        return `<div class="semester-week"><div class="week-label">${esc(dateLabel(week, { month: 'short', day: 'numeric' }))}<br><span>${esc(dateLabel(addDays(week, 6), { month: 'short', day: 'numeric' }))}</span></div><div class="week-events">${weekEvents.length ? weekEvents.map(eventHtml).join('') : '<span class="muted">No classes</span>'}</div></div>`;
+        return `<div class="semester-week"><div class="week-label">Week of ${esc(dateLabel(week, { month: 'short', day: 'numeric' }))}</div><div class="week-days">${dates.map((date) => { const dayEvents = events.filter((course) => eventOnDate(course, date)); return `<div class="week-day"><b>${dayLabels[dayIndex(date)]}<small>${date.getMonth() + 1}/${date.getDate()}</small></b><div class="week-day-events">${dayEvents.length ? dayEvents.map((course) => eventHtml(course, meetingOnDate(course, date))).join('') : '<span class="muted">—</span>'}</div></div>`; }).join('')}</div></div>`;
       }).join('')}</div>`;
     }
     return `<div class="calendar-page">${controls}<div class="calendar-note">${mode === 'semester' ? `Showing ${esc(selectedTerm === 'all' ? 'all semesters' : tlabel(selectedTerm))}` : `Showing ${esc(tlabel(cx.curId))}`} · ${events.length} scheduled course${events.length === 1 ? '' : 's'}</div>${body}</div>`;
@@ -262,7 +389,7 @@
       <div class="tile"><div class="k">Credits earned</div><div class="v">${t.done} <span class="muted" style="font-size:13px;font-weight:500">/ ${target}</span></div>
         <div class="bar" title="done / in progress / planned / unscheduled"><i class="b-done" style="width:${pc(t.done)}%"></i><i class="b-current" style="width:${pc(t.current)}%"></i><i class="b-planned" style="width:${pc(t.planned)}%"></i><i class="b-unsched" style="width:${pc(t.unscheduled)}%"></i></div>
         <div class="s">${t.current} in progress · ${t.planned} planned${t.unscheduled ? ` · ${t.unscheduled} unscheduled` : ''}</div></div>
-      <div class="tile"><div class="k">GPA</div><div class="v">${fmt(t.gpa)}</div><div class="s">${t.gpaCur != null && t.current ? `incl. current grades: ${fmt(t.gpaCur)}` : `${t.gpaCr} graded credits`}</div></div>
+      <div class="tile"><div class="k">GPA${t.transcript ? ' · MyPortal' : ''}</div><div class="v">${fmt(t.gpa, t.transcript ? 3 : 2)}</div><div class="s">${t.gpaCr} graded credits${t.transcript ? ` · imported ${esc(new Date(S.meta.transcript.fetchedAt).toLocaleDateString())}` : ''}${t.gpaCur != null && t.current ? `<br>incl. current grades: ${fmt(t.gpaCur)}` : ''}</div></div>
       <div class="tile"><div class="k">Standing</div><div class="v">${standing}</div><div class="s">Jr at ${S.settings.jrAt} · Sr at ${S.settings.srAt} cr</div></div>
       <div class="tile ${t.unscheduled ? 'meh' : 'good'}"><div class="k">Projected finish</div><div class="v">${t.unscheduled ? 'Incomplete' : esc(E.tinfo(ps.finish).label)}</div><div class="s">${t.unscheduled ? `${ps.unscheduled} course(s) unscheduled` : `${ps.terms} term(s) after ${esc(E.tinfo(cx.curId).label)}`}</div></div>
       <div class="tile ${diff === 0 ? 'good' : diff < 0 ? 'bad' : 'meh'}"><div class="k">Plan total</div><div class="v">${t.all} cr</div><div class="s">${diff === 0 ? `matches ${target} cr target` : diff < 0 ? `${-diff} cr short of ${target}` : `${diff} cr over ${target}`}</div></div>
@@ -283,19 +410,40 @@
     if (c.section?.onlineSession) chips.push(`<span class="chip prov">${esc(c.section.onlineSession)}</span>`);
     else if (c.section?.sectionCode) chips.push(`<span class="chip prov">${esc(c.section.sectionCode)}</span>`);
     if (c.term && c.portal?.byTerm?.[c.term]?.source === 'spreadsheet') chips.push('<span class="chip warn" title="No matching section was published in MyPortal">spreadsheet</span>');
-    if (/^[A-Z]{2,9}\s+\d{3,4}$/.test(c.code)) chips.push(`<button class="portal-check" data-act="course-availability" data-id="${esc(c.id)}" draggable="false" title="Check future MyPortal availability">MyPortal</button>`);
+    if (String(c.code || '').trim()) {
+      if (/^[A-Z]{2,9}\s+\d{3,4}L?(?:\s+\d{1,4})?$/.test(c.code)) {
+        chips.push(`<button class="portal-check" data-act="course-availability" data-id="${esc(c.id)}" draggable="false" title="Check future MyPortal availability">MyPortal</button>`);
+      }
+      chips.push(`<button class="portal-check" data-act="refresh-course" data-id="${esc(c.id)}" draggable="false" title="Search MyPortal directly and update the local SQLite catalog" ${courseRefreshBusy.has(c.id) ? 'disabled' : ''}>${courseRefreshBusy.has(c.id) ? 'Searching…' : '↻ Search MyPortal'}</button>`);
+    }
     const slots = opts.slots ? `<div class="slots">${opts.slots}</div>` : '';
     const req = c.prereqText ? `<div class="card-detail" title="${esc(c.prereqText)}"><span>Requires</span>${esc(c.prereqText)}</div>` : '';
-    const section = c.section ? `<div class="section-detail"><b>${esc(c.section.daysLabel || c.section.modality || 'Schedule TBA')}</b><span>${esc(c.section.timeLabel || '')}${c.section.timeOfDay ? ` · ${esc(c.section.timeOfDay)}` : ''}</span><small>${esc(c.section.beginDate || '')}${c.section.endDate ? `–${esc(c.section.endDate)}` : ''}</small></div>` : '';
+    const professor = c.section ? sectionProfessor(c.section) : '';
+    const sectionDates = c.section ? [c.section.beginDate, c.section.endDate].filter(Boolean).join('–') || 'Dates TBA' : '';
+    const section = c.section ? `<div class="section-detail"><b>${esc(c.section.daysLabel || c.section.modality || 'Schedule TBA')}</b><span class="section-time">${esc(sectionTime(c.section))}${c.section.timeOfDay ? ` · ${esc(c.section.timeOfDay)}` : ''}</span><small class="section-professor" title="Professor: ${esc(professor)}">${esc(professor)}</small><small class="section-dates" title="Class dates: ${esc(sectionDates)}">${esc(sectionDates)}</small></div>` : '';
     return `<div class="card cat-${esc(c.category)} ${errs.length ? 'has-err' : ''}" ${drag ? 'draggable="true"' : ''} data-act="open" data-id="${esc(c.id)}" tabindex="0" role="button">
       <div class="r1"><span class="code">${esc(c.code)}</span><span class="cr">${c.credits} cr</span></div>
       <div class="ttl">${esc(c.title)}${c.slot && !/Elective$/.test(c.title) ? ` <span class="muted">· ${esc(c.slot)}</span>` : ''}</div>
       ${section}${req}<div class="meta">${chips.join('')}</div>${slots}</div>`;
   }
 
+  function scheduleSortKey(c) {
+    const section = c.section || {};
+    const online = String(section.modality || '').toLowerCase() === 'online'
+      || Boolean(section.onlineSession)
+      || !(section.meetings || []).length && /online/i.test(String(section.daysLabel || section.schedule || ''));
+    const starts = (section.meetings || []).map((meeting) => Number(meeting.start)).filter(Number.isFinite);
+    const start = starts.length ? Math.min(...starts) : Number.POSITIVE_INFINITY;
+    return [online ? 1 : 0, start, c.code || ''];
+  }
+  function compareScheduledCourses(a, b) {
+    const x = scheduleSortKey(a), y = scheduleSortKey(b);
+    return x[0] - y[0] || x[1] - y[1] || x[2].localeCompare(y[2], undefined, { numeric: true });
+  }
+
   function colHtml(tid, cx, issues) {
     const ti = E.tinfo(tid), past = ti.key < cx.curKey, cur = tid === cx.curId;
-    const cs = S.courses.filter((c) => c.term === tid).sort(cmpCode);
+    const cs = S.courses.filter((c) => c.term === tid).sort(compareScheduledCourses);
     const load = cs.reduce((n, c) => n + c.credits, 0);
     const ti_iss = issues.byTerm[tid] || [];
     const loadCls = past ? '' : ti_iss.some((i) => i.level === 'error') ? 'over' : ti_iss.length ? 'under' : load ? 'ok' : '';
@@ -353,7 +501,7 @@
     const clashes = scheduleIssues().all.length;
     const syncText = S.meta.portalSyncedAt ? `Last synced ${new Date(S.meta.portalSyncedAt).toLocaleString()}` : 'MyPortal has not been synced yet';
     return `<div class="dashboard-grid">
-      <section class="panel dashboard-roadmap"><div class="dashboard-panel-head"><div><h3>Upcoming terms</h3><span class="muted">Your courses by semester</span></div><button class="btn primary" data-act="go-timeline">View timeline</button></div><div class="compact-timeline">${upcoming || '<div class="empty">Add a term to start planning.</div>'}</div></section>
+      <section class="panel dashboard-roadmap"><div class="dashboard-panel-head"><div><h3>Upcoming terms</h3><span class="muted">Your courses by semester</span></div><div class="dashboard-roadmap-actions"><button class="icon-btn" data-act="dashboard-scroll" data-dir="-1" title="Previous terms" aria-label="Previous terms">‹</button><button class="icon-btn" data-act="dashboard-scroll" data-dir="1" title="Next terms" aria-label="Next terms">›</button><button class="btn primary" data-act="go-timeline">View timeline</button></div></div><div class="compact-timeline">${upcoming || '<div class="empty">Add a term to start planning.</div>'}</div></section>
       <section class="panel dashboard-attention"><h3>Things to review</h3>
         <button class="attention-row" data-act="go-timeline"><span>Unscheduled courses</span><b class="${unscheduled ? 'warn-text' : ''}">${unscheduled}</b></button>
         <button class="attention-row" data-act="issues"><span>Schedule overlaps</span><b class="${clashes ? 'err-text' : ''}">${clashes}</b></button>
@@ -386,7 +534,7 @@
     const stack = (o, total) => `<div class="bar"><i class="b-done" style="width:${(o.done / total) * 100}%"></i><i class="b-current" style="width:${(o.current / total) * 100}%"></i><i class="b-planned" style="width:${(o.planned / total) * 100}%"></i><i class="b-unsched" style="width:${(o.unscheduled / total) * 100}%"></i></div>`;
     const catRows = Object.entries(cats).map(([k, o]) => {
       const tot = o.done + o.current + o.planned + o.unscheduled;
-      return `<div style="margin:10px 0"><div class="row" style="border:0;padding:0"><span class="grow"><span class="dot" style="background:var(--${k})"></span>${esc(CAT_NAME[k] || k)}</span><span class="muted">${o.done} done · ${o.current} now · ${o.planned} planned${o.unscheduled ? ` · ${o.unscheduled} unsched.` : ''}</span><b>${tot} cr</b></div>${stack(o, tot || 1)}</div>`;
+      return `<div class="category-progress"><div class="row"><span class="grow"><span class="dot" style="background:var(--${k})"></span>${esc(CAT_NAME[k] || k)}</span><span class="muted">${o.done} done · ${o.current} now · ${o.planned} planned${o.unscheduled ? ` · ${o.unscheduled} unsched.` : ''}</span><b>${tot} cr</b></div>${stack(o, tot || 1)}</div>`;
     }).join('');
 
     // minor tracker
@@ -418,7 +566,7 @@
     const earliest = fast.feasible ? E.tinfo(fast.stats.finish).label : 'not reachable in 14 terms';
     const slack = fast.feasible ? (E.tkey(mine.finish) === fast.finishKey ? 'Your plan already finishes at the earliest term these rules allow.' : E.tkey(mine.finish) > fast.finishKey ? 'Your plan finishes later than necessary; try Optimize.' : '') : '';
 
-    return `<div class="scroll"><div class="grid2">
+    return `<div class="scroll requirements-page"><div class="grid2">
       <div class="panel"><h3>Credit progress</h3>
         ${stack({ done: t.done, current: t.current, planned: t.planned, unscheduled: t.unscheduled }, Math.max(t.all, target))}
         <div class="legend"><span><i class="b-done"></i>Done ${t.done}</span><span><i class="b-current"></i>In progress ${t.current}</span><span><i class="b-planned"></i>Planned ${t.planned}</span><span><i class="b-unsched"></i>Unscheduled ${t.unscheduled}</span></div>
@@ -449,18 +597,20 @@
     }[sort] || ((c) => c.code);
     rows.sort((a, b) => { const x = key(a), y = key(b); return (typeof x === 'string' ? x.localeCompare(y, undefined, { numeric: true }) : x - y) * dir || cmpCode(a, b); });
     const th = (k, l) => `<th data-act="sort" data-k="${k}">${l}${sort === k ? (dir > 0 ? ' ▲' : ' ▼') : ''}</th>`;
-    return `<div class="filters">
-        <input type="search" placeholder="Search code, title, prereq…" value="${esc(q)}" data-act="filter" data-k="q" style="min-width:240px">
+    return `<div class="catalog-page"><div class="filters">
+        <input class="catalog-query" type="search" placeholder="Search code, title, prerequisite…" value="${esc(q)}" data-act="filter" data-k="q">
         <select data-act="filter" data-k="fStatus"><option value="">All statuses</option>${['done', 'current', 'planned', 'unscheduled'].map((s) => `<option ${fStatus === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
         <select data-act="filter" data-k="fCat"><option value="">All categories</option>${Object.entries(CAT_NAME).map(([k, v]) => `<option value="${k}" ${fCat === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
-        <span class="muted" style="align-self:center">${rows.length} of ${S.courses.length} courses</span>
-        <div class="catalog-actions">${undoStack.length ? '<button class="btn" data-act="undo">↶ Undo</button>' : ''}<button class="btn primary" data-act="live-search">Search MyPortal…</button></div></div>
-      <div class="scroll"><table class="t"><thead><tr>${th('code', 'Code')}${th('title', 'Title')}${th('cat', 'Category')}${th('cr', 'Cr')}${th('off', 'Offered')}${th('term', 'Term')}${th('status', 'Status')}${th('grade', 'Grade')}<th>Prerequisites</th>${th('unlocks', 'Unlocks')}<th>Plan</th></tr></thead><tbody>
+        <span class="catalog-count muted">${rows.length} of ${S.courses.length} courses</span>
+        <div class="catalog-actions">${undoStack.length ? '<button class="btn" data-act="undo">↶ Undo</button>' : ''}<button class="btn" data-act="catalog-search">Saved catalog</button><button class="btn primary" data-act="live-search">MyPortal</button></div></div>
+      <div class="scroll"><table class="t catalog-table"><thead><tr>${th('code', 'Code')}${th('title', 'Title')}${th('cat', 'Category')}${th('cr', 'Cr')}${th('off', 'Offered')}${th('term', 'Term')}${th('status', 'Status')}${th('grade', 'Grade')}<th>Prerequisites</th>${th('unlocks', 'Unlocks')}<th>Plan</th></tr></thead><tbody>
       ${rows.map((c) => { const st = E.statusOf(cx, c), n = (cx.dependents[c.id] || new Set()).size;
-        const locked = st === 'current' && !currentCourseEditable(c, cx);
-        const action = st === 'done' ? '<span class="muted">Completed</span>' : `<button class="btn sm" data-act="schedule-course" data-id="${esc(c.id)}" ${locked ? 'disabled title="This class has already started"' : ''}>${locked ? 'Locked' : c.term ? 'Reschedule' : 'Schedule'}</button>`;
-        return `<tr data-act="open" data-id="${esc(c.id)}"><td class="mono">${esc(c.code)}</td><td>${esc(c.title)}</td><td><span class="dot" style="background:var(--${c.category})"></span>${esc(CAT_NAME[c.category] || c.category)}</td><td class="num">${c.credits}</td><td>${esc(c.offered ? OFF_NAME[c.offered] || c.offered : '?')}</td><td>${esc(tlabel(c.term))}</td><td>${st}</td><td>${esc(c.grade || '')}</td><td class="muted">${esc(c.prereqText)}</td><td class="num" title="${n} course(s) list this as a prerequisite; longest chain after it: ${E.depth(cx, c) - 1}">${n || ''}</td><td>${action}</td></tr>`; }).join('')}
-      </tbody></table></div>`;
+        const inSession = st === 'current' && !currentCourseEditable(c, cx);
+        const action = st === 'done' ? '<span class="muted">Completed</span>'
+          : inSession ? `<button class="btn sm" data-act="open" data-id="${esc(c.id)}" title="The semester stays fixed, but its section can be changed">Change section</button>`
+          : `<button class="btn sm" data-act="schedule-course" data-id="${esc(c.id)}">${c.term ? 'Reschedule' : 'Schedule'}</button>`;
+        return `<tr data-act="open" data-id="${esc(c.id)}"><td class="mono catalog-code" data-label="Course">${esc(c.code)}</td><td class="catalog-title" data-label="Title">${esc(c.title)}</td><td class="catalog-secondary" data-label="Category"><span class="dot" style="background:var(--${c.category})"></span>${esc(CAT_NAME[c.category] || c.category)}</td><td class="num" data-label="Credits">${c.credits}</td><td class="catalog-secondary" data-label="Offered">${esc(c.offered ? OFF_NAME[c.offered] || c.offered : '?')}</td><td data-label="Term">${esc(tlabel(c.term))}</td><td data-label="Status">${st}</td><td data-label="Grade">${esc(c.grade || '—')}</td><td class="muted catalog-prereq" data-label="Prerequisites">${esc(c.prereqText || 'None')}</td><td class="num catalog-secondary" data-label="Unlocks" title="${n} course(s) list this as a prerequisite; longest chain after it: ${E.depth(cx, c) - 1}">${n || '—'}</td><td class="catalog-plan" data-label="Plan">${action}</td></tr>`; }).join('')}
+      </tbody></table></div></div>`;
   }
 
   /* ================= dialogs ================= */
@@ -473,35 +623,118 @@
     if (f === 'course') saveCourse();
     if (f === 'settings') saveSettings();
     if (f === 'live-search') searchMyPortal(e.target);
+    if (f === 'account') authenticateAccount('login');
+    if (f === 'password') changeAccountPassword();
   });
   const dlgShell = (title, body, foot) => `<div class="dlg-h"><h2>${title}</h2><button class="btn sm" data-act="close">Close</button></div><div class="dlg-b">${body}</div>${foot ? `<div class="dlg-f">${foot}</div>` : ''}`;
+
+  function themeButton() {
+    return `<button class="btn theme-toggle" data-theme-toggle aria-label="Dark mode" title="${document.documentElement.dataset.theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}" aria-pressed="${document.documentElement.dataset.theme === 'dark'}"><svg class="theme-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.9 13.1A9 9 0 0 1 10.9 3.1a9 9 0 1 0 10 10Z"/></svg><svg class="theme-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.4 1.4m11.2 11.2L19 19M5 19l1.4-1.4M17.6 6.4 19 5"/></svg></button>`;
+  }
+  function openMobileTools() {
+    openDlg(dlgShell('Planning tools', `<div class="mobile-tool-list"><button class="btn primary" data-act="optimize"><span aria-hidden="true">✦</span><span><b>Optimize plan</b><small>Compare faster schedules</small></span></button><div class="settings-controls"><button class="btn" data-act="settings"><span aria-hidden="true">⚙</span><span><b>Settings</b><small>Preferences, profile, and backups</small></span></button>${themeButton()}</div></div>`));
+  }
+
+  function openAccount() { openSettings('profile'); }
+
+  function accountPanel() {
+    if (!account.authenticated) {
+      const body = `<form class="form" data-form="account" autocomplete="on"><div class="callout fld full"><b>Use your schedule on multiple clients</b><br>Your existing browser plan is uploaded when a new account has no saved schedule. Signing into an existing account loads its server copy.</div><label class="fld full"><span>Username</span><input name="username" minlength="3" maxlength="32" pattern="[A-Za-z0-9._-]+" autocomplete="username" required></label><label class="fld full"><span>Password</span><input name="password" type="password" minlength="10" maxlength="72" autocomplete="current-password" required><small>At least 10 characters. Passwords are stored as salted bcrypt hashes.</small></label><button hidden type="submit"></button></form>`;
+      return { body, foot: '<button class="btn" data-act="account-register">Create account</button><button class="btn primary" data-act="account-login">Sign in</button>' };
+    }
+    const conflict = account.conflict ? `<div class="callout err"><b>Sync conflict</b><br>The server was updated by another client${account.conflict.updatedAt ? ` at ${esc(new Date(account.conflict.updatedAt).toLocaleString())}` : ''}. Reload its copy or overwrite it with this browser’s current plan.</div>` : '';
+    const status = account.syncing ? 'Syncing…' : account.updatedAt ? `Last synced ${new Date(account.updatedAt).toLocaleString()}` : 'This account does not have a saved schedule yet';
+    const passwordWarning = account.user.mustChangePassword ? '<div class="callout warn"><b>Change the default password</b><br>This account still uses the public default password, password123.</div>' : '';
+    const body = `${passwordWarning}${conflict}<div class="account-summary"><span class="account-avatar" aria-hidden="true">${esc(account.user.username.slice(0, 1).toUpperCase())}</span><div><b>${esc(account.user.username)}</b><span>${esc(status)}</span></div></div><p class="muted">Changes are saved locally first, then synchronized to this account. You can sign into the same account from another browser or device that can reach this server.</p>`;
+    const conflictActions = account.conflict ? '<button class="btn" data-act="account-reload">Use server copy</button><button class="btn danger" data-act="account-overwrite">Use this browser copy</button>' : '<button class="btn primary" data-act="account-sync">Sync now</button>';
+    return { body, foot: `<button class="btn grow" data-act="account-logout">Sign out</button><button class="btn" data-act="account-password">Change password</button>${conflictActions}` };
+  }
+
+  function openPasswordChange() {
+    const body = `<form class="form" data-form="password" autocomplete="on"><label class="fld full"><span>Current password</span><input name="currentPassword" type="password" autocomplete="current-password" required></label><label class="fld full"><span>New password</span><input name="newPassword" type="password" minlength="10" maxlength="72" autocomplete="new-password" required><small>At least 10 characters and no more than 72 UTF-8 bytes.</small></label><label class="fld full"><span>Confirm new password</span><input name="confirmPassword" type="password" minlength="10" maxlength="72" autocomplete="new-password" required></label><button hidden type="submit"></button></form>`;
+    $('#settings-panel-profile', dlg).innerHTML = body + '<div class="settings-actions"><button class="btn" data-act="account">Cancel</button><button class="btn primary" data-act="account-password-save">Change password</button></div>';
+  }
+
+  async function changeAccountPassword() {
+    const form = $('form[data-form="password"]', dlg); if (!form) return;
+    const fd = new FormData(form), currentPassword = String(fd.get('currentPassword') || ''), newPassword = String(fd.get('newPassword') || ''), confirmation = String(fd.get('confirmPassword') || '');
+    if (newPassword !== confirmation) return toast('New passwords do not match');
+    const button = $('[data-act="account-password-save"]', dlg); if (button) button.disabled = true;
+    try {
+      const response = await fetch('/api/change-password', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      const data = await response.json();
+      if (response.status === 401) throw new Error(data.error || 'Current password is incorrect');
+      if (!response.ok) throw new Error(data.error || 'Password change failed');
+      account.user.mustChangePassword = false;
+      openSettings('profile'); toast('Password changed; other client sessions were signed out');
+    } catch (error) {
+      toast(error.message); if (button) button.disabled = false;
+    }
+  }
+
+  async function authenticateAccount(mode) {
+    const form = $('form[data-form="account"]', dlg); if (!form) return;
+    const fd = new FormData(form), username = String(fd.get('username') || '').trim(), password = String(fd.get('password') || '');
+    const buttons = $$('[data-act="account-login"], [data-act="account-register"]', dlg);
+    buttons.forEach((button) => { button.disabled = true; });
+    try {
+      const response = await fetch(mode === 'register' ? '/api/register' : '/api/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `${mode === 'register' ? 'Registration' : 'Sign in'} failed`);
+      Object.assign(account, { authenticated: true, user: data.user, revision: 0, updatedAt: null, conflict: null });
+      localStorage.removeItem(SKIP_DEFAULT_LOGIN_KEY);
+      lastRemoteJson = '';
+      renderAccountIndicator();
+      const synchronized = await loadRemoteSchedule();
+      openSettings('profile');
+      if (synchronized) toast(mode === 'register' ? 'Account created and schedule synced' : `Signed in as ${data.user.username}`);
+    } catch (error) {
+      toast(error.message);
+      buttons.forEach((button) => { button.disabled = false; });
+    }
+  }
+
+  async function logoutAccount() {
+    try { await fetch('/api/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch (error) { /* Clear the local session view even if the server is unavailable. */ }
+    localStorage.setItem(SKIP_DEFAULT_LOGIN_KEY, '1');
+    setSignedOut(); openSettings('profile'); toast('Signed out; this browser copy remains available');
+  }
 
   function openCatalogSchedule(id) {
     const c = byId(id); if (!c) return;
     const cx = ctx();
-    if (c.term === cx.curId && !currentCourseEditable(c, cx)) return toast(`${c.code} has already started and cannot be rescheduled`);
+    if (c.term === cx.curId && !currentCourseEditable(c, cx)) return openCourse(id);
     const assign = E.currentAssign(cx);
-    const terms = S.terms.filter((term) => E.tkey(term) >= cx.curKey);
+    const terms = S.terms;
     const rows = terms.map((term) => {
       const problems = placementProblems(cx, assign, c, term);
       const assigned = c.term === term;
-      return `<div class="row"><div class="grow"><b>${esc(tlabel(term))}</b>${term === cx.curId ? '<br><span class="muted">Only sections starting after today</span>' : ''}${problems.length && !assigned ? `<br><span class="muted">${esc(problems[0].msg)}</span>` : ''}</div><button class="btn sm ${term === cx.curId ? 'primary' : ''}" data-act="catalog-place" data-id="${esc(c.id)}" data-term="${term}" ${assigned ? 'disabled' : ''}>${assigned ? 'Scheduled' : 'Choose'}</button></div>`;
+      return `<div class="row"><div class="grow"><b>${esc(tlabel(term))}</b>${problems.length && !assigned ? `<br><span class="muted">${esc(problems[0].msg)}</span>` : ''}</div><button class="btn sm ${term === cx.curId ? 'primary' : ''}" data-act="catalog-place" data-id="${esc(c.id)}" data-term="${term}" ${assigned ? 'disabled' : ''}>${assigned ? 'Scheduled' : 'Choose'}</button></div>`;
     }).join('');
     const foot = `${c.term ? '<button class="btn grow" data-act="catalog-unschedule" data-id="' + esc(c.id) + '">Unschedule</button>' : '<span class="grow"></span>'}<button class="btn" data-act="close">Cancel</button>`;
-    openDlg(dlgShell(`Schedule ${esc(c.code)}`, `<div class="callout"><b>${esc(c.title)}</b><br>Select a semester. Schedule will load MyPortal sections, recommend a conflict-free option, and enforce class start dates for the current semester.</div>${rows || '<div class="empty">No current or future semesters are available.</div>'}`, foot));
+    openDlg(dlgShell(`Schedule ${esc(c.code)}`, `<div class="callout"><b>${esc(c.title)}</b><br>Select any semester. Schedule will load MyPortal sections and recommend a conflict-free option.</div>${rows || '<div class="empty">No current or future semesters are available.</div>'}`, foot));
   }
 
   let editing = null; // {course, isNew}
-  function openCourse(id, presetTerm) {
+  async function openCourse(id, presetTerm) {
     const isNew = !id;
     const c = isNew ? fixCourse({ id: 'c' + Date.now().toString(36), code: '', title: '', category: 'elective', credits: 3, term: presetTerm || null, custom: true }) : byId(id);
+    if (!isNew && c?.term && c.term !== 'TR' && /^https?:$/.test(location.protocol)) {
+      try { await ensureSections(c, c.term); } catch (error) { /* Keep saved data when the local catalog is unavailable. */ }
+    }
     editing = { c, isNew };
     const cx = isNew ? E.makeCtx([...S.courses, c], S.settings) : ctx();
     const assign = E.currentAssign(cx);
-    const scheduleLocked = !isNew && c.term === cx.curId && !currentCourseEditable(c, cx);
+    const termLocked = !isNew && c.term === cx.curId && !currentCourseEditable(c, cx);
     const termOpts = ['', 'TR', ...S.terms].map((t) => {
       let note = '';
-      if (t && t !== 'TR' && E.tkey(t) >= cx.curKey) { const p = placementProblems(cx, assign, c, t); note = p.length ? `  ✗ ${p[0].msg}` : '  ✓'; }
+      if (t && t !== 'TR') { const p = placementProblems(cx, assign, c, t); note = p.length ? `  ✗ ${p[0].msg}` : '  ✓'; }
       return `<option value="${t}" ${c.term === t || (!c.term && t === '') ? 'selected' : ''}>${esc(t === 'TR' ? 'Transfer credit' : t ? tlabel(t) : 'Unscheduled')}${esc(note)}</option>`;
     }).join('');
     const st = E.statusOf(cx, c), cur = c.term ? E.tkey(c.term) : null;
@@ -518,20 +751,23 @@
     const myIssues = isNew ? [] : (LIVE.issues.byCourse[c.id] || []);
     const termSections = c.term ? sectionsFor(c, c.term) : [];
     const portalTerm = c.term ? c.portal?.byTerm?.[c.term] : null;
+    const canRefresh = !isNew && /^[A-Z]{2,9}\s+\d{3,4}$/.test(c.code);
+    const refreshSectionsButton = canRefresh
+      ? `<button type="button" class="btn sm" data-act="refresh-course" data-id="${esc(c.id)}" ${courseRefreshBusy.has(c.id) ? 'disabled' : ''}>${courseRefreshBusy.has(c.id) ? 'Refreshing…' : '↻ Refresh from MyPortal'}</button>` : '';
     const sectionOptions = termSections.map((section) => {
-      const label = [section.onlineSession || section.sectionCode, section.daysLabel, section.timeLabel, `${section.beginDate}–${section.endDate}`, section.status].filter(Boolean).join(' · ');
+      const label = [section.onlineSession || section.sectionCode, section.daysLabel, sectionTime(section), sectionProfessor(section), `${section.beginDate}–${section.endDate}`, section.status].filter(Boolean).join(' · ');
       return `<option value="${esc(sectionKey(section))}" ${sectionKey(section) === sectionKey(c.section) ? 'selected' : ''}>${esc(label)}</option>`;
     }).join('');
-    const sectionBlock = c.term && c.term !== 'TR' ? `<div class="form-section-title fld full"><span>Class schedule</span></div>
-      ${termSections.length ? `<label class="fld full"><span>MyPortal section</span>${scheduleLocked ? `<input type="hidden" name="section" value="${esc(sectionKey(c.section))}">` : ''}<select name="section" ${scheduleLocked ? 'disabled' : ''}><option value="">Recommend a conflict-free section</option>${sectionOptions}</select><small>${scheduleLocked ? 'This section has already started, so its semester and section are locked.' : 'R means Thursday. Saving a changed term recommends a non-overlapping section automatically.'}</small></label>`
+    const sectionBlock = c.term && c.term !== 'TR' ? `<div class="form-section-title with-action fld full"><span>Class schedule</span>${refreshSectionsButton}</div>
+      ${termSections.length ? `<label class="fld full"><span>MyPortal section</span><select name="section"><option value="">Recommend a conflict-free section</option>${sectionOptions}</select><small>R means Thursday. Saving a changed term recommends a non-overlapping section automatically.</small></label>`
         : `<div class="callout warn fld full"><b>${portalTerm?.source === 'spreadsheet' ? 'Spreadsheet fallback' : 'Section data not loaded'}</b><br>${portalTerm?.source === 'spreadsheet' ? 'This course is not listed in MyPortal for this semester, so its spreadsheet information is retained.' : 'Sync MyPortal from the Timeline tab to load sections, dates, days, and times.'}</div>`}
-      ${c.section ? `<div class="course-facts fld full"><div><span>Section</span><b>${esc(c.section.onlineSession || c.section.sectionCode || '—')}</b></div><div><span>Days</span><b>${esc(c.section.daysLabel || 'Online/TBA')}</b></div><div><span>Time</span><b>${esc(c.section.timeLabel || 'Asynchronous/TBA')}</b></div><div><span>Class dates</span><b>${esc(c.section.beginDate || '—')}–${esc(c.section.endDate || '—')}</b></div></div>` : ''}` : '';
+      ${c.section ? `<div class="course-facts fld full"><div><span>Section</span><b>${esc(c.section.onlineSession || c.section.sectionCode || '—')}</b></div><div><span>Professor</span><b>${esc(sectionProfessor(c.section))}</b></div><div><span>Days</span><b>${esc(c.section.daysLabel || 'Online/TBA')}</b></div><div><span>Time</span><b>${esc(sectionTime(c.section))}</b></div><div><span>Class dates</span><b>${esc(c.section.beginDate || '—')}–${esc(c.section.endDate || '—')}</b></div></div>` : ''}` : '';
     const portalTerms = Object.entries(c.portal?.byTerm || {}).sort(([a], [b]) => E.tkey(a) - E.tkey(b));
     const portalOverview = portalTerms.length > 1 ? `<div class="form-section-title fld full"><span>Published MyPortal terms</span></div>
       <div class="portal-term-list fld full">${portalTerms.map(([term, data]) => {
         const sections = data.sections || [];
         const details = sections.length
-          ? sections.map((section) => esc([section.onlineSession || section.sectionCode, section.daysLabel, section.timeLabel, `${section.beginDate}–${section.endDate}`].filter(Boolean).join(' · '))).join('<br>')
+          ? sections.map((section) => esc([section.onlineSession || section.sectionCode, section.daysLabel, sectionTime(section), sectionProfessor(section), `${section.beginDate}–${section.endDate}`].filter(Boolean).join(' · '))).join('<br>')
           : data.source === 'spreadsheet' ? 'Not published; spreadsheet data retained' : 'Not listed in this published term';
         return `<div class="portal-term-row"><b>${esc(data.termLabel || tlabel(term))}</b><span>${details}</span></div>`;
       }).join('')}</div>` : '';
@@ -541,7 +777,7 @@
       <div class="form-section-title fld full"><span>Course information</span></div>
       <label class="fld"><span>Code</span><input name="code" value="${esc(c.code)}" required class="mono"></label>
       <label class="fld"><span>Title</span><input name="title" value="${esc(c.title)}" required></label>
-      <label class="fld"><span>Term</span>${scheduleLocked ? `<input type="hidden" name="term" value="${esc(c.term)}">` : ''}<select name="term" ${scheduleLocked ? 'disabled' : ''}>${termOpts}</select>${scheduleLocked ? '<small>The class is already in session.</small>' : ''}</label>
+      <label class="fld"><span>Term</span>${termLocked ? `<input type="hidden" name="term" value="${esc(c.term)}">` : ''}<select name="term" ${termLocked ? 'disabled' : ''}>${termOpts}</select>${termLocked ? '<small>The class is already in session.</small>' : ''}</label>
       <label class="fld"><span>Grade ${st === 'current' ? '(so far)' : ''}</span><select name="grade"><option value=""></option>${E.GRADES.map((g) => `<option ${c.grade === g ? 'selected' : ''}>${g}</option>`).join('')}</select></label>
       <label class="fld"><span>Credits</span><input name="credits" type="number" min="0" max="12" step="1" value="${c.credits}"></label>
       <label class="fld"><span>Offered</span><select name="offered">${[['', 'Unknown'], ['ALL', 'Any term'], ['FA', 'Fall'], ['SP', 'Spring'], ['SU', 'Summer']].map(([v, l]) => `<option value="${v}" ${(c.offered || '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
@@ -557,7 +793,7 @@
       <div class="form-section-title fld full"><span>Notes</span></div>
       <label class="fld full"><span>Notes</span><textarea name="notes" rows="2">${esc(c.notes)}</textarea></label>
       <button hidden type="submit"></button></form>`;
-    const foot = `${!isNew ? (c.custom && !scheduleLocked ? '<button class="btn danger grow" data-act="delete-course">Delete</button>' : c.term && !scheduleLocked ? '<button class="btn grow" data-act="unschedule">Unschedule</button>' : '<span class="grow"></span>') : '<span class="grow"></span>'}
+    const foot = `${!isNew ? (c.custom && !termLocked ? '<button class="btn danger grow" data-act="delete-course">Delete</button>' : c.term && !termLocked ? '<button class="btn grow" data-act="unschedule">Unschedule</button>' : '<span class="grow"></span>') : '<span class="grow"></span>'}
       <button class="btn" data-act="close">Cancel</button><button class="btn primary" data-act="save-course">${isNew ? 'Add course' : 'Save'}</button>`;
     openDlg(dlgShell(`${esc(c.code || 'New course')} ${c.title ? `<span class="muted" style="font-weight:400">— ${esc(c.title)}</span>` : ''}`, body, foot));
   }
@@ -567,19 +803,19 @@
     const code = String(fd.get('code')).trim().toUpperCase().replace(/\s+/, ' '), title = String(fd.get('title')).trim();
     if (!code || !title) return toast('Code and title are required');
     const credits = Math.max(0, Math.min(12, Number(fd.get('credits')) || 0));
-    const cx = ctx(), scheduleLocked = !isNew && c.term === cx.curId && !currentCourseEditable(c, cx);
-    const targetTerm = scheduleLocked ? c.term : fd.get('term') || null;
-    let selectedSection = scheduleLocked ? c.section : null;
-    if (!scheduleLocked && targetTerm && targetTerm !== 'TR') {
+    const cx = ctx(), termLocked = !isNew && c.term === cx.curId && !currentCourseEditable(c, cx);
+    const targetTerm = termLocked ? c.term : fd.get('term') || null;
+    let selectedSection = targetTerm === c.term ? c.section : null;
+    if (targetTerm && targetTerm !== 'TR') {
       try {
         if (isNew) Object.assign(c, { code, title });
         const sections = await ensureSections(c, targetTerm);
         const requested = targetTerm === c.term ? String(fd.get('section') || '') : '';
-        const upcomingOnly = targetTerm === cx.curId;
+        const upcomingOnly = false;
         const requestedSection = sections.find((s) => sectionKey(s) === requested);
         selectedSection = requestedSection && (!upcomingOnly || sectionNotStarted(requestedSection)) ? requestedSection : recommendSection(c, targetTerm, sectionKey(c.section), upcomingOnly);
         if (sections.length && !selectedSection) return toast(`Cannot schedule ${code}: ${upcomingOnly ? 'no not-yet-started section fits your schedule' : 'every published section overlaps another class'}`);
-        if (upcomingOnly && !selectedSection) return toast(`Cannot schedule ${code}: a future class start date is required for the current semester`);
+        if (upcomingOnly && !selectedSection) return toast(`Cannot schedule ${code}: no compatible section is available`);
         const conflicts = selectedSection ? sectionConflicts(c, selectedSection, targetTerm) : [];
         if (conflicts.length) return toast(`${sectionSummary(selectedSection)} overlaps ${conflicts.map((x) => x.code).join(', ')}`);
       } catch (err) {
@@ -603,8 +839,7 @@
   function mergePortalData(data) {
     for (const [id, incoming] of Object.entries(data.courses || {})) {
       const c = byId(id); if (!c) continue;
-      c.portal ||= { byTerm: {} };
-      Object.assign(c.portal.byTerm, incoming.byTerm || {});
+      c.portal = { byTerm: incoming.byTerm || {} };
     }
     if (data.publishedTerms) S.meta.portalPublishedTerms = data.publishedTerms;
   }
@@ -620,54 +855,143 @@
   }
   async function ensureSections(c, term) {
     if (!term || term === 'TR') return [];
-    if (c.portal?.byTerm?.[term]) return sectionsFor(c, term);
-    const data = await requestEnrichment([coursePayload(c, term)], term);
+    const cached = sectionsFor(c, term);
+    const cachedTerm = c.portal?.byTerm?.[term];
+    const preferred = sectionKey(c.section);
+    let data;
+    try {
+      data = await requestEnrichment([coursePayload(c, term)], term);
+    } catch (error) {
+      // A listed section remains editable while the catalog is refreshing or
+      // temporarily unavailable. The next successful hydration replaces it
+      // with the canonical SQLite copy.
+      if (cached.length) return cached;
+      throw error;
+    }
     if (!byId(c.id)) {
       c.portal ||= { byTerm: {} };
       Object.assign(c.portal.byTerm, data.courses?.[c.id]?.byTerm || {});
     }
-    return sectionsFor(c, term);
+    const current = byId(c.id) || c;
+    const fresh = sectionsFor(current, term);
+    const sections = E.sectionsForEdit(fresh, cached);
+    if (sections === cached && cached.length && cachedTerm) {
+      current.portal ||= { byTerm: {} };
+      current.portal.byTerm[term] = cachedTerm;
+    }
+    if (current.term === term && current.section) {
+      current.section = sections.find((section) => sectionKey(section) === preferred) || null;
+      save();
+    }
+    return sections;
   }
   async function syncMyPortal(silent = false) {
     if (portalSyncBusy) return;
     portalSyncBusy = true; render();
-    if (!silent) toast('Matching spreadsheet courses to MyPortal…');
+    if (!silent) toast('Refreshing the local MyPortal catalog…');
     try {
-      const scheduled = S.courses.filter((c) => c.term && c.term !== 'TR');
-      const remaining = S.courses.filter((c) => !c.term || c.term === 'TR');
-      let data = { errors: [] };
-      if (scheduled.length) data = await requestEnrichment(scheduled.map((c) => coursePayload(c)));
-      if (remaining.length) {
-        const rest = await requestEnrichment(remaining.map((c) => coursePayload(c)));
-        data = { errors: [...(data.errors || []), ...(rest.errors || [])] };
-      }
       const preferred = new Map(S.courses.map((c) => [c.id, sectionKey(c.section)]));
+      const refreshResponse = await fetch('/api/catalog-refresh', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: '{}',
+      });
+      const refreshed = await refreshResponse.json();
+      if (!refreshResponse.ok) throw new Error(refreshed.error || `Catalog refresh failed (${refreshResponse.status})`);
+      portal.options = null;
+      const data = S.courses.length
+        ? await requestEnrichment(S.courses.map((c) => coursePayload(c)))
+        : { errors: [] };
       for (const c of S.courses) if (c.term && c.portal?.byTerm?.[c.term]) c.section = null;
       for (const c of [...S.courses].filter((x) => x.term).sort((a, b) => E.tkey(a.term) - E.tkey(b.term) || cmpCode(a, b))) {
         if (sectionsFor(c, c.term).length) c.section = recommendSection(c, c.term, preferred.get(c.id));
       }
-      S.meta.portalSyncedAt = new Date().toISOString();
+      S.meta.portalSyncedAt = refreshed.catalog?.syncedAt || new Date().toISOString();
       save();
       const matched = S.courses.filter((c) => c.term && c.portal?.byTerm?.[c.term]?.source === 'myportal').length;
       const fallback = S.courses.filter((c) => c.term && c.portal?.byTerm?.[c.term]?.source === 'spreadsheet').length;
-      if (!silent) toast(`MyPortal synced: ${matched} matched · ${fallback} spreadsheet fallback${data.errors?.length ? ` · ${data.errors.length} error(s)` : ''}`);
+      if (!silent) toast(`MyPortal catalog: ${refreshed.sections} sections · ${matched} matched · ${fallback} spreadsheet fallback${data.errors?.length ? ` · ${data.errors.length} error(s)` : ''}`);
     } catch (err) {
       if (!silent) toast(`MyPortal sync failed: ${err.message}`);
     } finally { portalSyncBusy = false; render(); }
   }
 
+  async function refreshCourse(id, button) {
+    const c = byId(id);
+    if (!c || courseRefreshBusy.has(id)) return;
+    if (!/^[A-Z]{2,9}\s+\d{3,4}L?(?:\s+\d{1,4})?$/.test(c.code)) return toast('A standard course code is required to refresh sections');
+    const reopen = dlg.open && editing?.c.id === id;
+    const preferred = sectionKey(c.section);
+    courseRefreshBusy.add(id);
+    if (button instanceof HTMLButtonElement) { button.disabled = true; button.textContent = 'Refreshing…'; }
+    render();
+    toast(`Refreshing ${c.code} from MyPortal…`);
+    try {
+      const response = await fetch('/api/course-refresh', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ courseCode: c.code, title: c.title }),
+      });
+      const refreshed = await response.json();
+      if (!response.ok) throw new Error(refreshed.error || `Course refresh failed (${response.status})`);
+      portal.options = null;
+      await requestEnrichment([coursePayload(c)], c.term || E.currentTermId(S.settings));
+      if (c.term) {
+        const sections = sectionsFor(c, c.term);
+        c.section = sections.find((section) => sectionKey(section) === preferred)
+          || recommendSection(c, c.term, '', false);
+      }
+      S.meta.portalSyncedAt = refreshed.refreshedAt || S.meta.portalSyncedAt;
+      save(); render();
+      const termCount = refreshed.terms?.filter((term) => term.sections).length || 0;
+      toast(`${c.code}: ${refreshed.sections} section${refreshed.sections === 1 ? '' : 's'} refreshed across ${termCount} term${termCount === 1 ? '' : 's'}`);
+    } catch (error) {
+      toast(`${c.code} refresh failed: ${error.message}`);
+    } finally {
+      courseRefreshBusy.delete(id);
+      render();
+      if (reopen && dlg.open) await openCourse(id);
+    }
+  }
+
+  async function hydrateMyPortal() {
+    if (!/^https?:$/.test(location.protocol) || !S.courses.length) return;
+    try {
+      const statusResponse = await fetch('/api/catalog-status', { headers: { Accept: 'application/json' } });
+      const status = await statusResponse.json();
+      if (!statusResponse.ok || !status.available) return;
+      const preferred = new Map(S.courses.map((c) => [c.id, sectionKey(c.section)]));
+      await requestEnrichment(S.courses.map((c) => coursePayload(c)));
+      for (const c of S.courses) {
+        if (!c.term || !c.portal?.byTerm?.[c.term]) continue;
+        c.section = recommendSection(c, c.term, preferred.get(c.id));
+      }
+      S.meta.portalSyncedAt = status.syncedAt || S.meta.portalSyncedAt;
+      save(); render();
+    } catch (error) { /* The planner remains usable with its saved data. */ }
+  }
+
   /* ---------- live MyPortal course search ---------- */
-  let portal = { options: null, results: [], query: {}, loading: false, error: '' };
+  let portal = { options: null, optionsMode: '', results: [], query: {}, loading: false, error: '', mode: 'live' };
   const optionsHtml = (items, value) => items.map((o) => `<option value="${esc(o.value)}" ${o.value === value ? 'selected' : ''}>${esc(o.label)}</option>`).join('');
+  function renderCatalogSearch() {
+    if (!portal.options) {
+      openPortalSearch('catalog');
+      return;
+    }
+    portal.mode = 'catalog';
+    renderPortalSearch();
+  }
+
   function renderPortalSearch() {
+    const live = portal.mode !== 'catalog';
     if (!portal.options) {
       openDlg(dlgShell('Search MyPortal', `<div class="callout ${portal.error ? 'err' : ''}">${portal.error ? esc(portal.error) : 'Loading current terms and search options…'}</div>`, portal.error ? '<button class="btn" data-act="close">Close</button><button class="btn primary" data-act="live-search">Try again</button>' : ''), true);
       return;
     }
     const o = portal.options, q = portal.query;
-    const auth = o.cookieConfigured ? 'Using the session cookie configured on the local server.' : 'MyPortal currently allows this search without signing in; no cookie is configured.';
-    const form = `<form class="form portal-form" data-form="live-search" autocomplete="off">
-      <div class="callout fld full"><b>Live MyPortal data</b><br>${esc(auth)} Results are read-only until you add one to the plan.</div>
+    const updated = o.catalog?.syncedAt ? ` Last updated ${new Date(o.catalog.syncedAt).toLocaleString()}.` : '';
+    const title = live ? 'Search MyPortal live' : 'Search saved MyPortal catalog';
+    const action = live ? 'live-search' : 'catalog-search';
+    const form = `<form class="form portal-form" data-form="${action}" autocomplete="off">
+      <div class="callout fld full"><b>${live ? 'Live MyPortal search' : 'Local MyPortal catalog'}</b><br>${live ? 'Searches contact MyPortal directly to find course metadata. Results can be added to your plan.' : `Searches use the completed SQLite snapshot and do not contact MyPortal.${esc(updated)} Results are read-only until you add one to the plan.`}</div>
       <label class="fld"><span>Term</span><select name="term" required>${optionsHtml(o.terms, q.term || o.terms.find((x) => x.value)?.value)}</select></label>
       <label class="fld"><span>Department</span><select name="department">${optionsHtml(o.departments, q.department || '')}</select></label>
       <label class="fld"><span>Course number</span><input name="courseNumber" value="${esc(q.courseNumber || '')}" placeholder="e.g. 253"></label>
@@ -679,21 +1003,26 @@
     </form>`;
     const results = portal.error ? `<div class="callout err">${esc(portal.error)}</div>` : portal.loading ? '<div class="empty">Searching MyPortal…</div>'
       : portal.searched && !portal.results.length ? '<div class="empty">No matching courses found.</div>'
-      : portal.results.length ? `<div class="scroll portal-results"><table class="t"><thead><tr><th>Course</th><th>Title</th><th>Section</th><th>Faculty</th><th>Seats</th><th>Status</th><th>Days / time</th><th>Cr</th><th>Dates</th><th></th></tr></thead><tbody>${portal.results.map((r, i) => {
+      : portal.results.length ? `<div class="scroll portal-results"><table class="t"><thead><tr><th>Course</th><th>Title</th><th>Section</th><th>Professor</th><th>Seats</th><th>Status</th><th>Days / time</th><th>Cr</th><th>Dates</th><th></th></tr></thead><tbody>${portal.results.map((r, i) => {
         const existing = S.courses.some((c) => c.code === r.baseCode || (c.alt || []).includes(r.baseCode));
-        return `<tr><td class="mono">${esc(r.courseCode)}</td><td>${esc(r.title)}</td><td><span class="chip prov">${esc(r.onlineSession || r.sectionCode || '—')}</span><br><span class="muted">${esc(r.modality || '')}</span></td><td>${esc(r.faculty)}</td><td>${esc(r.seats)}</td><td><span class="chip ${r.status === 'Open' ? 'grade' : 'warn'}">${esc(r.status)}</span></td><td><b>${esc(r.daysLabel || 'TBA')}</b><br>${esc(r.timeLabel || 'TBA')}<br><span class="muted">${esc(r.timeOfDay || '')}</span></td><td class="num">${esc(r.credits)}</td><td>${esc(r.beginDate)}<br><span class="muted">to ${esc(r.endDate)}</span></td><td><button class="btn sm" data-act="add-portal-course" data-i="${i}">${existing ? 'Schedule' : 'Add to plan'}</button></td></tr>`;
+        return `<tr><td class="mono">${esc(r.courseCode)}</td><td>${esc(r.title)}</td><td><span class="chip prov">${esc(r.onlineSession || r.sectionCode || '—')}</span><br><span class="muted">${esc(r.modality || '')}</span></td><td>${esc(sectionProfessor(r))}</td><td>${esc(r.seats)}</td><td><span class="chip ${r.status === 'Open' ? 'grade' : 'warn'}">${esc(r.status)}</span></td><td><b>${esc(r.daysLabel || 'TBA')}</b><br>${esc(sectionTime(r))}<br><span class="muted">${esc(r.timeOfDay || '')}</span></td><td class="num">${esc(r.credits)}</td><td>${esc(r.beginDate)}<br><span class="muted">to ${esc(r.endDate)}</span></td><td><button class="btn sm" data-act="add-portal-course" data-i="${i}">${existing ? 'Schedule' : 'Add to plan'}</button></td></tr>`;
       }).join('')}</tbody></table></div>` : '';
-    openDlg(dlgShell('Search MyPortal', form + results, '<button class="btn" data-act="close">Close</button>'), true);
+    openDlg(dlgShell(title, form + results, '<button class="btn" data-act="close">Close</button>'), true);
   }
-  async function openPortalSearch() {
+  async function openPortalSearch(mode = 'live') {
+    portal.mode = mode;
     portal.error = '';
-    if (portal.options) return renderPortalSearch();
+    if (portal.options && portal.optionsMode === portal.mode) return renderPortalSearch();
+    portal.options = null;
+    portal.optionsMode = portal.mode;
     renderPortalSearch();
     try {
-      const response = await fetch('/api/course-search/options', { headers: { Accept: 'application/json' } });
+      const optionsEndpoint = portal.mode === 'live' ? '/api/course-search-live/options' : '/api/course-search/options';
+      const response = await fetch(optionsEndpoint, { headers: { Accept: 'application/json' } });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
       portal.options = data;
+      portal.optionsMode = portal.mode;
     } catch (err) { portal.error = err.message + '. Start the app with python3 server.py.'; }
     renderPortalSearch();
   }
@@ -701,7 +1030,8 @@
     const fd = new FormData(form);
     portal.query = Object.fromEntries(fd.entries()); portal.loading = true; portal.error = ''; portal.searched = true; renderPortalSearch();
     try {
-      const response = await fetch('/api/course-search', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(portal.query) });
+      const endpoint = portal.mode === 'catalog' ? '/api/course-search' : '/api/course-search-live';
+      const response = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(portal.query) });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
       portal.results = data.results || [];
@@ -712,12 +1042,11 @@
     const r = portal.results[index]; if (!r) return;
     const existing = S.courses.find((c) => c.code === r.baseCode || (c.alt || []).includes(r.baseCode));
     const currentTerm = E.currentTermId(S.settings);
-    if (existing?.term === currentTerm && !currentCourseEditable(existing)) return toast(`${existing.code} has already started and cannot be rescheduled`);
-    if (r.planTerm === currentTerm && existing?.term !== currentTerm && !sectionNotStarted(r)) return toast('That section has already started and cannot be added to the current semester');
+    if (existing?.term === currentTerm && !currentCourseEditable(existing) && r.planTerm !== existing.term) return toast(`${existing.code} has already started and cannot be moved to another semester`);
     const conflictTarget = existing || { id: '__new__' };
     const conflicts = r.planTerm ? sectionConflicts(conflictTarget, r, r.planTerm) : [];
     if (conflicts.length) return toast(`${sectionSummary(r)} overlaps ${conflicts.map((c) => c.code).join(', ')}`);
-    const detail = `MyPortal section: ${r.courseCode} · ${r.faculty || 'Faculty TBA'} · ${r.schedule || 'Schedule TBA'} · ${r.seats || 'Seats unknown'} · ${r.beginDate}–${r.endDate}`;
+    const detail = `MyPortal section: ${r.courseCode} · ${sectionProfessor(r)} · ${r.schedule || 'Schedule TBA'} · ${r.seats || 'Seats unknown'} · ${r.beginDate}–${r.endDate}`;
     mutate(() => {
       if (existing) {
         if (r.planTerm) Object.assign(existing, { term: r.planTerm, section: r });
@@ -755,7 +1084,7 @@
       const sections = term.results || [];
       if (!sections.length) return `<section class="availability-term"><h3>${esc(term.termLabel)} <span class="chip">not listed</span></h3><div class="muted">No ${esc(c.code)} sections were found.</div></section>`;
       return `<section class="availability-term"><h3>${esc(term.termLabel)} <span class="chip grade">${sections.length} section${sections.length === 1 ? '' : 's'}</span></h3>
-        <div class="scroll"><table class="t"><thead><tr><th>Section</th><th>Type</th><th>Status</th><th>Seats</th><th>Faculty</th><th>Days / time</th><th>Dates</th><th>Credits</th></tr></thead><tbody>${sections.map((r) => `<tr><td class="mono">${esc(r.courseCode)}</td><td><span class="chip prov">${esc(r.onlineSession || r.sectionCode || '—')}</span><br><span class="muted">${esc(r.modality || '')}</span></td><td><span class="chip ${r.status === 'Open' ? 'grade' : 'warn'}">${esc(r.status)}</span></td><td>${esc(r.seats)}</td><td>${esc(r.faculty || 'TBA')}</td><td><b>${esc(r.daysLabel || 'TBA')}</b><br>${esc(r.timeLabel || 'TBA')}<br><span class="muted">${esc(r.timeOfDay || '')}</span></td><td>${esc(r.beginDate)}<br><span class="muted">to ${esc(r.endDate)}</span></td><td class="num">${esc(r.credits)}</td></tr>`).join('')}</tbody></table></div>
+        <div class="scroll"><table class="t"><thead><tr><th>Section</th><th>Type</th><th>Status</th><th>Seats</th><th>Professor</th><th>Days / time</th><th>Dates</th><th>Credits</th></tr></thead><tbody>${sections.map((r) => `<tr><td class="mono">${esc(r.courseCode)}</td><td><span class="chip prov">${esc(r.onlineSession || r.sectionCode || '—')}</span><br><span class="muted">${esc(r.modality || '')}</span></td><td><span class="chip ${r.status === 'Open' ? 'grade' : 'warn'}">${esc(r.status)}</span></td><td>${esc(r.seats)}</td><td>${esc(sectionProfessor(r))}</td><td><b>${esc(r.daysLabel || 'TBA')}</b><br>${esc(sectionTime(r))}<br><span class="muted">${esc(r.timeOfDay || '')}</span></td><td>${esc(r.beginDate)}<br><span class="muted">to ${esc(r.endDate)}</span></td><td class="num">${esc(r.credits)}</td></tr>`).join('')}</tbody></table></div>
       </section>`;
     }).join('');
     openDlg(dlgShell(`${esc(c.code)} availability`, summary + rows, '<button class="btn" data-act="close">Close</button>'), true);
@@ -777,36 +1106,85 @@
     }
   }
 
-  function openSettings() {
+  function openSettings(tab = 'general') {
+    const profile = accountPanel();
+    const panels = {
+      general: generalPanel(),
+      profile,
+      data: { body: dataPanel(), foot: '' },
+    };
+    const labels = { general: 'General', profile: 'Profile', data: 'Data & backup' };
+    const tabs = Object.keys(panels).map((id) => `<button type="button" class="settings-tab" role="tab" id="settings-tab-${id}" aria-controls="settings-panel-${id}" aria-selected="${id === tab}" tabindex="${id === tab ? 0 : -1}" data-act="settings-tab" data-tab="${id}">${labels[id]}</button>`).join('');
+    const content = Object.entries(panels).map(([id, panel]) => `<section id="settings-panel-${id}" role="tabpanel" aria-labelledby="settings-tab-${id}" tabindex="0" ${id === tab ? '' : 'hidden'}>${panel.body}${panel.foot ? `<div class="settings-actions">${panel.foot}</div>` : ''}</section>`).join('');
+    openDlg(dlgShell('Settings', `<div class="settings-tabs" role="tablist" aria-orientation="vertical" aria-label="Settings sections">${tabs}</div>${content}`));
+    dlg.classList.add('settings-dialog');
+  }
+  function selectSettingsTab(tab, focus = false) {
+    $$('[data-act="settings-tab"]', dlg).forEach((button) => {
+      const selected = button.dataset.tab === tab;
+      button.setAttribute('aria-selected', String(selected));
+      button.tabIndex = selected ? 0 : -1;
+      if (selected && focus) button.focus();
+      document.getElementById(button.getAttribute('aria-controls')).hidden = !selected;
+    });
+  }
+  function generalPanel() {
     const s = S.settings, num = (n, l, h) => `<label class="fld"><span>${l}</span><input type="number" name="${n}" value="${s[n]}" min="0" step="1">${h ? `<small>${h}</small>` : ''}</label>`;
-    openDlg(dlgShell('Settings', `<form class="form" data-form="settings">
+    return { body: `<form class="form" data-form="settings">
       ${num('minLoad', 'Full-time minimum (cr / term)', 'Under this → warning (fall/spring only)')}
       ${num('maxLoad', 'Maximum load (cr / term)', 'Over this → error; optimizer cap')}
       ${num('targetCredits', 'Credits to graduate')}
-      <label class="fld"><span>Current term</span><select name="currentTerm"><option value="auto" ${s.currentTerm === 'auto' ? 'selected' : ''}>Auto (from today's date: ${esc(tlabel(E.currentTermId({ currentTerm: 'auto' })))})</option>${S.terms.map((t) => `<option value="${t}" ${s.currentTerm === t ? 'selected' : ''}>${esc(tlabel(t))}</option>`).join('')}</select><small>Terms before this are treated as completed and are not validated.</small></label>
+      <label class="fld"><span>Current term</span><select name="currentTerm"><option value="auto" ${s.currentTerm === 'auto' ? 'selected' : ''}>Auto (from today's date: ${esc(tlabel(E.currentTermId({ currentTerm: 'auto' })))})</option>${S.terms.map((t) => `<option value="${t}" ${s.currentTerm === t ? 'selected' : ''}>${esc(tlabel(t))}</option>`).join('')}</select><small>Terms before this are treated as completed. Current-term sections can always be changed, even after classes begin.</small></label>
       ${num('jrAt', 'Junior standing at (cr earned)')}${num('srAt', 'Senior standing at (cr earned)', 'Check your catalog; used for “Jr./Sr. Standing” prereqs')}
+      <label class="fld"><span>Schedule time format</span><select name="timeFormat"><option value="standard" ${s.timeFormat !== 'military' ? 'selected' : ''}>Standard (12-hour)</option><option value="military" ${s.timeFormat === 'military' ? 'selected' : ''}>Military (24-hour)</option></select><small>Controls the daily schedule hour labels and meeting times.</small></label>
       <label class="fld check full"><input type="checkbox" name="summerAll" ${s.summerAll ? 'checked' : ''}><span>Treat courses offered “ALL” as available in summer<br><small>Off by default: the control sheet does not say whether ALL includes summer. Confirm with your registrar before relying on summer plans.</small></span></label>
-      <button hidden type="submit"></button></form>`, '<button class="btn" data-act="close">Cancel</button><button class="btn primary" data-act="save-settings">Save</button>'));
+      <button hidden type="submit"></button></form>`, foot: '<button class="btn" data-act="close">Cancel</button><button class="btn primary" data-act="save-settings">Save</button>' };
   }
   function saveSettings() {
     const fd = new FormData($('form[data-form="settings"]', dlg));
     const n = (k) => Math.max(0, Number(fd.get(k)) || 0);
     if (n('minLoad') > n('maxLoad')) return toast('Minimum load cannot exceed maximum');
-    mutate(() => Object.assign(S.settings, { minLoad: n('minLoad'), maxLoad: n('maxLoad'), targetCredits: n('targetCredits'), jrAt: n('jrAt'), srAt: n('srAt'), summerAll: !!fd.get('summerAll'), currentTerm: fd.get('currentTerm') }));
+    mutate(() => Object.assign(S.settings, { minLoad: n('minLoad'), maxLoad: n('maxLoad'), targetCredits: n('targetCredits'), jrAt: n('jrAt'), srAt: n('srAt'), summerAll: !!fd.get('summerAll'), currentTerm: fd.get('currentTerm'), timeFormat: fd.get('timeFormat') === 'military' ? 'military' : 'standard' }));
     closeDlg(); toast('Settings saved');
   }
 
-  function openData() {
-    openDlg(dlgShell('Data', `<p class="muted">Everything is stored in this browser (localStorage). Export a JSON backup to move it between devices or browsers.</p>
+  function openData() { openSettings('data'); }
+
+  function dataPanel() {
+    return `<p class="muted">Changes are stored in this browser${account.authenticated ? ` and synchronized to ${esc(account.user.username)}` : ' (localStorage)'}. Export a JSON backup for an additional portable copy.</p>
+      <div class="row"><span class="grow"><b>MyPortal transcript</b><br><span class="muted">Use official GPA credits and quality points. Sign in to the account that owns the portal cookie store.</span></span><button class="btn" data-act="import-transcript">Import transcript</button>${S.meta?.transcript ? '<button class="btn" data-act="clear-transcript">Use planner GPA</button>' : ''}</div>
       <div class="row"><span class="grow"><b>Backup</b><br><span class="muted">Full state: courses, terms, settings</span></span><button class="btn" data-act="export-json">Export JSON</button><button class="btn" data-act="import-json">Import JSON…</button></div>
       <div class="row"><span class="grow"><b>Schedule as CSV</b><br><span class="muted">One row per course. Code and Title are required; Term may be an ID such as FA26 or a label such as Fall 2026.</span></span><button class="btn" data-act="export-csv">Export CSV</button><button class="btn" data-act="import-csv">Import CSV…</button></div>
       <div class="row"><span class="grow"><b>Start a blank schedule</b><br><span class="muted">Removes the spreadsheet courses and starts with the current semester.</span></span><button class="btn danger" data-act="blank">Create blank…</button></div>
-      <div class="row"><span class="grow"><b>Reset plan</b><br><span class="muted">Discards all courses and starts a blank local schedule.</span></span><button class="btn danger" data-act="reset">Reset…</button></div>`));
+      <div class="row"><span class="grow"><b>Reset plan</b><br><span class="muted">Discards all courses and starts a blank local schedule.</span></span><button class="btn danger" data-act="reset">Reset…</button></div>`;
+  }
+  let transcriptBusy = false;
+  async function importTranscript() {
+    if (transcriptBusy) return;
+    if (!account.authenticated) { toast('Sign in before importing your transcript'); openAccount(); return; }
+    transcriptBusy = true;
+    const ownerId = account.user.id, targetState = S;
+    const button = $('[data-act="import-transcript"]', dlg);
+    if (button) { button.disabled = true; button.textContent = 'Importing…'; }
+    try {
+      const response = await fetch('/api/transcript', { method: 'POST', headers: { Accept: 'application/json' } });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Transcript import failed');
+      if (!account.authenticated || account.user.id !== ownerId || S !== targetState)
+        throw new Error('The active schedule changed. Import the transcript again');
+      mutate(() => { S.meta = { ...S.meta, transcript: data }; });
+      closeDlg(); toast('Transcript imported. GPA now uses MyPortal totals');
+    } catch (error) {
+      toast(error.message);
+    } finally {
+      transcriptBusy = false;
+      if (button) { button.disabled = false; button.textContent = 'Import transcript'; }
+    }
   }
   function exportCsv() {
     const cx = ctx(), q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-    const rows = [['Term', 'Code', 'Title', 'Credits', 'Grade', 'Status', 'Category', 'Offered', 'Section', 'Days', 'Time', 'Time of day', 'Class start', 'Class end', 'Source', 'Prerequisites'], ...[...S.courses].sort((a, b) => (a.term ? E.tkey(a.term) : 1e9) - (b.term ? E.tkey(b.term) : 1e9) || cmpCode(a, b))
-      .map((c) => [tlabel(c.term), c.code, c.title, c.credits, c.grade || '', E.statusOf(cx, c), CAT_NAME[c.category] || c.category, c.offered || '', c.section?.onlineSession || c.section?.sectionCode || '', c.section?.daysLabel || '', c.section?.timeLabel || '', c.section?.timeOfDay || '', c.section?.beginDate || '', c.section?.endDate || '', c.term ? c.portal?.byTerm?.[c.term]?.source || 'spreadsheet' : 'spreadsheet', c.prereqText])];
+    const rows = [['Term', 'Code', 'Title', 'Credits', 'Grade', 'Status', 'Category', 'Offered', 'Section', 'Professor', 'Days', 'Time', 'Time of day', 'Class start', 'Class end', 'Source', 'Prerequisites'], ...[...S.courses].sort((a, b) => (a.term ? E.tkey(a.term) : 1e9) - (b.term ? E.tkey(b.term) : 1e9) || cmpCode(a, b))
+      .map((c) => [tlabel(c.term), c.code, c.title, c.credits, c.grade || '', E.statusOf(cx, c), CAT_NAME[c.category] || c.category, c.offered || '', c.section?.onlineSession || c.section?.sectionCode || '', c.section?.faculty || '', c.section?.daysLabel || '', c.section ? sectionTime(c.section) : '', c.section?.timeOfDay || '', c.section?.beginDate || '', c.section?.endDate || '', c.term ? c.portal?.byTerm?.[c.term]?.source || 'spreadsheet' : 'spreadsheet', c.prereqText])];
     download('schedule.csv', rows.map((r) => r.map(q).join(',')).join('\n'), 'text/csv');
   }
   function parseCsv(text) {
@@ -909,14 +1287,14 @@
     const sc = scenarios && scenarios[i]; if (!sc) return;
     mutate(() => { for (const c of sc.plan.pending) { const t = sc.plan.assign[c.id]; Object.assign(byId(c.id), { term: t, section: null }); } });
     closeDlg(); toast(`Applied “${sc.title}”. Undo is available`);
-    syncMyPortal(true);
+    hydrateMyPortal();
   }
 
   /* ================= events ================= */
   async function placeCourse(id, term) {
     const c = byId(id); if (!c || c.term === term) return false;
     const cx = ctx();
-    if (c.term === cx.curId && !currentCourseEditable(c, cx)) { toast(`${c.code} has already started and cannot be rescheduled`); return false; }
+    // Courses can be moved even when their semester is complete or in progress.
     const probs = term ? E.placementProblems(cx, E.currentAssign(cx), c, term) : [];
     let section = null;
     if (term && term !== 'TR') {
@@ -925,7 +1303,7 @@
         const upcomingOnly = term === cx.curId;
         section = recommendSection(c, term, sectionKey(c.section), upcomingOnly);
         if (sections.length && !section) { toast(`Cannot place ${c.code}: ${upcomingOnly ? 'no not-yet-started section fits your schedule' : 'every published section overlaps another class'}`); return false; }
-        if (upcomingOnly && !section) { toast(`Cannot place ${c.code}: a future class start date is required for the current semester`); return false; }
+        if (upcomingOnly && !section) { toast(`Cannot place ${c.code}: no compatible section is available`); return false; }
       } catch (err) {
         if (term === cx.curId) { toast(`Cannot verify a future start date for ${c.code}: ${err.message}`); return false; }
         toast(`MyPortal unavailable; placing ${c.code} with spreadsheet data`);
@@ -946,6 +1324,11 @@
       case 'tab': S.ui.tab = d.tab; save(); render(); break;
       case 'go-schedule':
       case 'go-timeline': S.ui.tab = 'timeline'; save(); render(); break;
+      case 'dashboard-scroll': {
+        const timeline = $('.compact-timeline');
+        if (timeline) timeline.scrollBy({ left: Number(d.dir) * Math.max(220, timeline.clientWidth * 0.8), behavior: 'smooth' });
+        break;
+      }
       case 'calendar-mode': S.ui.calendarMode = d.mode; save(); render(); break;
       case 'calendar-today':
         S.ui.calendarDate = isoDate(new Date());
@@ -968,11 +1351,26 @@
       case 'undo': undo(); break;
       case 'optimize': openOptimizer(); break;
       case 'settings': openSettings(); break;
+      case 'settings-tab': selectSettingsTab(d.tab); break;
       case 'data': openData(); break;
-      case 'live-search': openPortalSearch(); break;
+      case 'import-transcript': importTranscript(); break;
+      case 'clear-transcript': mutate(() => { delete S.meta.transcript; }); closeDlg(); toast('Using planner grades for GPA'); break;
+      case 'mobile-tools': openMobileTools(); break;
+      case 'account': openAccount(); break;
+      case 'account-login': authenticateAccount('login'); break;
+      case 'account-register': authenticateAccount('register'); break;
+      case 'account-logout': logoutAccount(); break;
+      case 'account-password': openPasswordChange(); break;
+      case 'account-password-save': changeAccountPassword(); break;
+      case 'account-sync': closeDlg(); pushRemoteSchedule(false, true); break;
+      case 'account-reload': closeDlg(); loadRemoteSchedule(true); break;
+      case 'account-overwrite': closeDlg(); pushRemoteSchedule(true, true); break;
+      case 'live-search': openPortalSearch('live'); break;
+      case 'catalog-search': openPortalSearch('catalog'); break;
       case 'sync-portal': syncMyPortal(); break;
       case 'add-portal-course': addPortalCourse(Number(d.i)); break;
       case 'course-availability': e.stopPropagation(); openCourseAvailability(d.id); break;
+      case 'refresh-course': e.stopPropagation(); refreshCourse(d.id, el); break;
       case 'schedule-course': e.stopPropagation(); openCatalogSchedule(d.id); break;
       case 'catalog-place': e.stopPropagation(); placeCourse(d.id, d.term).then((placed) => { if (placed) closeDlg(); }); break;
       case 'catalog-unschedule': e.stopPropagation(); placeCourse(d.id, null).then((placed) => { if (placed) closeDlg(); }); break;
@@ -983,12 +1381,11 @@
       case 'place': e.stopPropagation(); placeCourse(d.id, d.term); break;
       case 'save-course': saveCourse(); break;
       case 'save-settings': saveSettings(); break;
-      case 'unschedule': if (!currentCourseEditable(editing.c, LIVE.cx)) { toast('This class has already started'); break; } mutate(() => { Object.assign(byId(editing.c.id), { term: null, section: null }); }); closeDlg(); break;
-      case 'delete-course': if (!currentCourseEditable(editing.c, LIVE.cx)) { toast('This class has already started'); break; } if (confirm(`Delete ${editing.c.code}?`)) { mutate(() => { S.courses = S.courses.filter((c) => c.id !== editing.c.id); }); closeDlg(); } break;
+      case 'unschedule': mutate(() => { Object.assign(byId(editing.c.id), { term: null, section: null }); }); closeDlg(); break;
+      case 'delete-course': if (confirm(`Delete ${editing.c.code}?`)) { mutate(() => { S.courses = S.courses.filter((c) => c.id !== editing.c.id); }); closeDlg(); } break;
       case 'add-term': { const last = S.terms[S.terms.length - 1] || E.currentTermId(S.settings); mutate(() => { S.terms.push(E.nextTermId(last, S.ui.showSummers)); }); break; }
       case 'remove-term': {
         const courses = S.courses.filter((c) => c.term === d.term), label = tlabel(d.term);
-        if (d.term === LIVE.cx.curId && courses.some((c) => !currentCourseEditable(c, LIVE.cx))) { toast('The current semester contains courses that have already started'); break; }
         const detail = courses.length ? ` ${courses.length} course${courses.length === 1 ? '' : 's'} will move to Unscheduled.` : '';
         if (confirm(`Remove ${label}?${detail}`)) {
           mutate(() => { S.courses.forEach((c) => { if (c.term === d.term) Object.assign(c, { term: null, section: null }); }); S.terms = S.terms.filter((t) => t !== d.term); });
@@ -1007,6 +1404,12 @@
     }
   });
   document.addEventListener('keydown', (e) => {
+    if (e.target.matches('[data-act="settings-tab"]') && ['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) {
+      e.preventDefault();
+      const tabs = $$('[data-act="settings-tab"]', dlg), index = tabs.indexOf(e.target);
+      const next = e.key === 'Home' ? 0 : e.key === 'End' ? tabs.length - 1 : (index + (e.key === 'ArrowDown' ? 1 : -1) + tabs.length) % tabs.length;
+      selectSettingsTab(tabs[next].dataset.tab, true);
+    }
     if ((e.key === 'Enter' || e.key === ' ') && e.target.matches('.card[data-act="open"]')) { e.preventDefault(); openCourse(e.target.dataset.id); }
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.target.matches('input, textarea, select') && !dlg.open) { e.preventDefault(); undo(); }
   });
@@ -1046,10 +1449,9 @@
   function markTargets(id) {
     const c = byId(id), cx = ctx(), assign = E.currentAssign(cx);
     $$('.col').forEach((col) => {
-      const t = col.dataset.term, past = E.tinfo(t).key < cx.curKey;
+      const t = col.dataset.term;
       col.classList.remove('drop-ok', 'drop-bad', 'drop-na');
       const msg = $('.dropmsg', col);
-      if (past) { col.classList.add('drop-na'); msg.textContent = ''; return; }
       const p = placementProblems(cx, assign, c, t);
       col.classList.add(p.length ? 'drop-bad' : 'drop-ok');
       msg.textContent = p.length ? '✗ ' + p[0].msg + (p.length > 1 ? ` (+${p.length - 1})` : '') : '✓ fits here';
@@ -1063,20 +1465,24 @@
     setTimeout(() => { el.classList.add('dragging'); document.body.classList.add('dragging'); markTargets(dragId); }, 0);
   });
   document.addEventListener('dragend', () => { dragId = null; document.body.classList.remove('dragging'); $$('.drop-ok,.drop-bad,.drop-na,.dragging').forEach((n) => n.classList.remove('drop-ok', 'drop-bad', 'drop-na', 'dragging')); });
-  document.addEventListener('dragover', (e) => { if (dragId && e.target.closest && (e.target.closest('.col:not(.drop-na)') || e.target.closest('.pool'))) e.preventDefault(); });
+  document.addEventListener('dragover', (e) => { if (dragId && e.target.closest && (e.target.closest('.col') || e.target.closest('.pool'))) e.preventDefault(); });
   document.addEventListener('drop', (e) => {
     if (!dragId) return; const id = dragId;
     const col = e.target.closest('.col'), pool = e.target.closest('.pool');
-    if (col && !col.classList.contains('drop-na')) { e.preventDefault(); placeCourse(id, col.dataset.term); }
+    if (col) { e.preventDefault(); placeCourse(id, col.dataset.term); }
     else if (pool) { e.preventDefault(); placeCourse(id, null); }
   });
 
   /* ================= boot ================= */
   (async () => {
     const saved = localStorage.getItem(KEY);
+    hadLocalState = Boolean(saved);
     S = saved ? loadState() : (await loadExternalSeed()) || blankState();
     normalizeTerms(); render();
-    if (!S.meta.portalSyncedAt && /^https?:$/.test(location.protocol)) setTimeout(() => syncMyPortal(true), 0);
+    if (/^https?:$/.test(location.protocol)) {
+      await restoreAccount();
+      setTimeout(hydrateMyPortal, 0);
+    }
     window.__sched = { get state() { return S; }, Engine: E, render };
   })();
 })();

@@ -4,8 +4,45 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Schedule Manager</title>
-<link rel="stylesheet" href="style.css">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f5de8'/%3E%3Cpath d='M8 11h16M8 16h16M8 21h10' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+<meta name="theme-color" content="#003057">
+<script>
+/* Apply the saved theme before CSS loads to avoid a flash on navigation. */
+(() => {
+  'use strict';
+  const key = 'schedmgr.theme';
+  const system = window.matchMedia('(prefers-color-scheme: dark)');
+  let preference = null;
+  try { preference = localStorage.getItem(key); } catch { /* Storage may be unavailable. */ }
+  if (preference !== 'light' && preference !== 'dark') preference = null;
+
+  function apply() {
+    const dark = (preference || (system.matches ? 'dark' : 'light')) === 'dark';
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', dark ? '#0b253b' : '#003057');
+    document.querySelectorAll('[data-theme-toggle]').forEach((button) => {
+      button.setAttribute('aria-pressed', String(dark));
+      button.title = dark ? 'Switch to light mode' : 'Switch to dark mode';
+    });
+  }
+
+  apply();
+  document.addEventListener('DOMContentLoaded', apply);
+  system.addEventListener('change', apply);
+  window.addEventListener('storage', (event) => {
+    if (event.key !== key && event.key !== null) return;
+    preference = event.newValue === 'light' || event.newValue === 'dark' ? event.newValue : null;
+    apply();
+  });
+  document.addEventListener('click', (event) => {
+    if (!event.target.closest('[data-theme-toggle]')) return;
+    preference = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    try { localStorage.setItem(key, preference); } catch { /* Keep the choice for this page. */ }
+    apply();
+  });
+})();
+</script>
+<link rel="stylesheet" href="style.css?v=20261116-settings-2">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23003057'/%3E%3Cpath d='M8 11h16M8 16h16M8 21h10' stroke='%23c5b783' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
 </head>
 <body>
 <div class="app-layout">
@@ -16,9 +53,12 @@
     <div class="nav-label">Tools</div>
     <div class="actions">
       <button class="btn primary" data-act="optimize"><span aria-hidden="true">✦</span><span class="action-label">Optimize plan</span></button>
-      <button class="btn" data-act="settings"><span aria-hidden="true">⚙</span><span class="action-label">Settings</span></button>
-      <button class="btn" data-act="data"><span aria-hidden="true">↕</span><span class="action-label">Data &amp; backup</span></button>
+      <div class="settings-controls">
+        <button class="btn" data-act="settings"><span aria-hidden="true">⚙</span><span class="action-label">Settings</span></button>
+        <button class="btn theme-toggle" data-theme-toggle aria-label="Dark mode" title="Toggle light/dark mode" aria-pressed="false"><svg class="theme-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.9 13.1A9 9 0 0 1 10.9 3.1a9 9 0 1 0 10 10Z"/></svg><svg class="theme-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.4 1.4m11.2 11.2L19 19M5 19l1.4-1.4M17.6 6.4 19 5"/></svg></button>
+      </div>
     </div>
+    <button class="mobile-tools" data-act="mobile-tools" aria-label="Open planning tools"><span aria-hidden="true">•••</span><b>More</b></button>
   </aside>
 
   <section class="workspace">
@@ -32,7 +72,7 @@
 <input type="file" id="file-import" accept="application/json,.json,text/csv,.csv" hidden>
 
 <noscript>This app needs JavaScript.</noscript>
-<script src="engine.js"></script>
-<script src="app.js"></script>
+<script src="engine.js?v=20261026-1"></script>
+<script src="app.js?v=20261116-settings-2"></script>
 </body>
 </html>

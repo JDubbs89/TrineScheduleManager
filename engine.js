@@ -8,9 +8,17 @@
   const SEASON_ORD = { SP: 0, SU: 1, FA: 2 };
   const GRADE_PTS = { 'A+': 4, A: 4, 'A-': 3.7, 'B+': 3.3, B: 3, 'B-': 2.7, 'C+': 2.3, C: 2, 'C-': 1.7, 'D+': 1.3, D: 1, 'D-': 0.7, F: 0 };
   const GRADES = ['A', 'A-', 'B+', 'B', 'B-', 'C+', 'C', 'C-', 'D+', 'D', 'F', 'W', 'T'];
-  const DEFAULTS = { minLoad: 12, maxLoad: 18, targetCredits: 120, jrAt: 60, srAt: 90, summerAll: false, currentTerm: 'auto' };
+  const DEFAULTS = { minLoad: 12, maxLoad: 18, targetCredits: 120, jrAt: 60, srAt: 90, summerAll: false, currentTerm: 'auto', timeFormat: 'standard' };
 
   const tid = (season, year) => season + String(year).slice(-2);
+  const requiresFutureSection = ({ courseTerm, targetTerm, currentTerm, isNew = false }) =>
+    targetTerm === currentTerm && (isNew || courseTerm !== targetTerm);
+  const sectionsForEdit = (fresh, cached) => fresh?.length ? fresh : (cached || []);
+  const sectionTimeLabel = (section) => {
+    const labels = (section?.meetings || []).map((meeting) =>
+      meeting.startLabel && meeting.endLabel ? `${meeting.startLabel}–${meeting.endLabel}` : '').filter(Boolean);
+    return [...new Set(labels)].join(', ') || section?.timeLabel || 'Time TBA';
+  };
   function tinfo(id) {
     if (id === 'TR') return { id, season: 'TR', year: 0, key: -1e9, label: 'Transfer' };
     const m = /^(FA|SP|SU)(\d\d)$/.exec(id);
@@ -74,7 +82,7 @@
       }
     }
     const curId = currentTermId(settings, opts.now);
-    return { courses, settings, idx, dependents, curId, curKey: tinfo(curId).key, summerAll: opts.summerAll ?? settings.summerAll, depthMemo: {} };
+    return { courses, settings, idx, dependents, curId, curKey: tinfo(curId).key, summerAll: opts.summerAll ?? settings.summerAll, depthMemo: {}, transcript: opts.transcript || null };
   }
   function statusOf(ctx, c) {
     if (!c.term) return 'unscheduled';
@@ -175,19 +183,36 @@
   /* ---------- stats ---------- */
   function totals(ctx) {
     const t = { done: 0, current: 0, planned: 0, unscheduled: 0, all: 0, pts: 0, gpaCr: 0, ptsCur: 0, gpaCrCur: 0 };
+    const transcript = ctx.transcript;
+    const official = transcript?.source === 'myportal' && Number.isFinite(transcript.gpaCredits) && transcript.gpaCredits >= 0
+      && Number.isFinite(transcript.qualityPoints) && transcript.qualityPoints >= 0 && Number.isFinite(transcript.gpa);
+    const recorded = new Set(), portalPoints = {};
+    if (official) {
+      t.pts = t.ptsCur = transcript.qualityPoints;
+      t.gpaCr = t.gpaCrCur = transcript.gpaCredits;
+      for (const c of transcript.courses || []) {
+        if (c.grade !== 'WIP') recorded.add(c.code);
+        if (c.gpaCredits > 0 && c.repeat === '-' && gradePts(c.grade) != null)
+          portalPoints[c.grade] = c.qualityPoints / c.gpaCredits;
+      }
+    }
     for (const c of ctx.courses) {
       const cr = Number(c.credits) || 0, st = statusOf(ctx, c);
       t.all += cr;
       if (st === 'done') { if (earnsCredit(c)) t.done += cr; }
       else t[st] += cr;
-      const p = gradePts(c.grade);
+      const p = official ? (portalPoints[c.grade] ?? gradePts(c.grade)) : gradePts(c.grade);
       if (p != null && c.grade !== 'W') {
-        if (st === 'done') { t.pts += p * cr; t.gpaCr += cr; }
-        if (st === 'done' || st === 'current') { t.ptsCur += p * cr; t.gpaCrCur += cr; }
+        if (!official && st === 'done') { t.pts += p * cr; t.gpaCr += cr; }
+        const alreadyRecorded = [c.code, ...(c.alt || [])].some((code) => recorded.has(code));
+        if (official ? st === 'current' && !alreadyRecorded : st === 'done' || st === 'current') {
+          t.ptsCur += p * cr; t.gpaCrCur += cr;
+        }
       }
     }
-    t.gpa = t.gpaCr ? t.pts / t.gpaCr : null;
+    t.gpa = t.gpaCr ? (official ? transcript.gpa : t.pts / t.gpaCr) : null;
     t.gpaCur = t.gpaCrCur ? t.ptsCur / t.gpaCrCur : null;
+    t.transcript = !!official;
     return t;
   }
   function planStats(ctx, assign) {
@@ -272,5 +297,6 @@
     SEASON_NAME, GRADES, GRADE_PTS, DEFAULTS, tid, tinfo, tkey, nextTermId, currentTermId, gradePts, earnsCredit,
     parsePrereq, normCode, makeCtx, statusOf, currentAssign, depth, creditsBefore, offerProblem, prereqProblems, termLoad,
     computeIssues, placementProblems, totals, planStats, plan, scenarios, futureTermIds,
+    requiresFutureSection, sectionsForEdit, sectionTimeLabel,
   };
 })(typeof window !== 'undefined' ? window : globalThis);
